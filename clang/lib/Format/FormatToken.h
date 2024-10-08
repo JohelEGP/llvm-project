@@ -55,6 +55,12 @@ namespace format {
   TYPE(ControlStatementLBrace)                                                 \
   TYPE(ControlStatementRBrace)                                                 \
   TYPE(CppCastLParen)                                                          \
+  TYPE(Cpp2DeclarationBinaryOperator)                                          \
+  TYPE(Cpp2DeclarationColon)                                                   \
+  TYPE(Cpp2Identifier)                                                         \
+  TYPE(Cpp2Keyword)                                                            \
+  TYPE(Cpp2PeriodPeriod)                                                       \
+  TYPE(Cpp2PostfixOperator)                                                    \
   TYPE(CSharpGenericTypeConstraint)                                            \
   TYPE(CSharpGenericTypeConstraintColon)                                       \
   TYPE(CSharpGenericTypeConstraintComma)                                       \
@@ -888,6 +894,10 @@ public:
     // Detect "(inline|export)? namespace" in the beginning of a line.
     if (NamespaceTok && NamespaceTok->isOneOf(tok::kw_inline, tok::kw_export))
       NamespaceTok = NamespaceTok->getNextNonComment();
+    if (NamespaceTok && NamespaceTok->is(TT_Cpp2Identifier))
+      NamespaceTok = NamespaceTok->getNextNonComment();
+    if (NamespaceTok && NamespaceTok->is(TT_Cpp2DeclarationColon))
+      NamespaceTok = NamespaceTok->getNextNonComment();
     return NamespaceTok &&
                    NamespaceTok->isOneOf(tok::kw_namespace, TT_NamespaceMacro)
                ? NamespaceTok
@@ -1096,8 +1106,16 @@ struct AdditionalKeywords {
     kw_internal_ident_after_define =
         &IdentTable.get("__CLANG_FORMAT_INTERNAL_IDENT_AFTER_DEFINE__");
 
+    // Cpp2 keywords
+    kw_next = &IdentTable.get("next");
+    kw_inspect = &IdentTable.get("inspect");
+    kw_copy = &IdentTable.get("copy");
+    kw_move = &IdentTable.get("move");
+    kw_forward = &IdentTable.get("forward");
+    kw_pre = &IdentTable.get("pre");
+    kw_post = &IdentTable.get("post");
+
     // C# keywords
-    kw_dollar = &IdentTable.get("dollar");
     kw_base = &IdentTable.get("base");
     kw_byte = &IdentTable.get("byte");
     kw_checked = &IdentTable.get("checked");
@@ -1280,8 +1298,7 @@ struct AdditionalKeywords {
     kw_then = &IdentTable.get("then");
 
     // Keep this at the end of the constructor to make sure everything here
-    // is
-    // already initialized.
+    // is already initialized.
     JsExtraKeywords = std::unordered_set<IdentifierInfo *>(
         {kw_as, kw_async, kw_await, kw_declare, kw_finally, kw_from,
          kw_function, kw_get, kw_import, kw_is, kw_let, kw_module, kw_override,
@@ -1410,6 +1427,15 @@ struct AdditionalKeywords {
   IdentifierInfo *kw___has_include;
   IdentifierInfo *kw___has_include_next;
 
+  // Cpp2 keywords.
+  IdentifierInfo *kw_inspect;
+  IdentifierInfo *kw_next;
+  IdentifierInfo *kw_copy;
+  IdentifierInfo *kw_move;
+  IdentifierInfo *kw_forward;
+  IdentifierInfo *kw_pre;
+  IdentifierInfo *kw_post;
+
   // JavaScript keywords.
   IdentifierInfo *kw_as;
   IdentifierInfo *kw_async;
@@ -1465,7 +1491,6 @@ struct AdditionalKeywords {
   IdentifierInfo *kw_internal_ident_after_define;
 
   // C# keywords
-  IdentifierInfo *kw_dollar;
   IdentifierInfo *kw_base;
   IdentifierInfo *kw_byte;
   IdentifierInfo *kw_checked;
@@ -1656,7 +1681,7 @@ struct AdditionalKeywords {
   bool isWordLike(const FormatToken &Tok, bool IsVerilog = true) const {
     // getIdentifierinfo returns non-null for keywords as well as identifiers.
     return Tok.Tok.getIdentifierInfo() &&
-           (!IsVerilog || !isVerilogKeywordSymbol(Tok));
+           (!IsVerilog || !isVerilogKeywordSymbol(Tok)) && !Tok.is(tok::dollar);
   }
 
   /// Returns \c true if \p Tok is a true JavaScript identifier, returns

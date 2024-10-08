@@ -63,6 +63,12 @@ std::string computeName(const FormatToken *NamespaceTok) {
   assert(NamespaceTok &&
          NamespaceTok->isOneOf(tok::kw_namespace, TT_NamespaceMacro) &&
          "expecting a namespace token");
+  if (const FormatToken *Tok = NamespaceTok->getPreviousNonComment();
+      Tok && Tok->is(TT_Cpp2DeclarationColon)) {
+    Tok = Tok->getPreviousNonComment();
+    return Tok ? std::string{Tok->TokenText} : "_";
+  }
+
   std::string name;
   const FormatToken *Tok = NamespaceTok->getNextNonComment();
   if (NamespaceTok->is(TT_NamespaceMacro)) {

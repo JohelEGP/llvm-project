@@ -552,7 +552,7 @@ void LeftRightQualifierAlignmentFixer::fixQualifierAlignment(
 
   for (AnnotatedLine *Line : AnnotatedLines) {
     fixQualifierAlignment(Line->Children, Tokens, Fixes);
-    if (!Line->Affected || Line->InPPDirective)
+    if (!Line->Affected || Line->InPPDirective || Line->InCpp2Declaration)
       continue;
     FormatToken *First = Line->First;
     assert(First);

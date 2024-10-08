@@ -278,6 +278,31 @@ private:
       return tryMergeSimpleBlock(I, E, Limit);
     }
 
+    if (TheLine->InCpp2Declaration && NextLine.InCpp2Declaration) {
+      const bool MergeUnbracedParameterizedStatement =
+          TheLine->First->is(TT_FunctionTypeLParen) &&
+          NextLine.First->isNot(tok::l_brace);
+      const AnnotatedLine *const ThirdLine = I + 2 != E ? I[2] : nullptr;
+      const auto EndsContract = [&](FormatToken *Tok) {
+        if (Tok->isNot(tok::r_paren) || !Tok->MatchingParen ||
+            !Tok->MatchingParen->Previous)
+          return false;
+        Tok = Tok->MatchingParen->Previous;
+        if (Tok->is(tok::greater)) {
+          if (!Tok->MatchingParen || !Tok->MatchingParen->Previous)
+            return false;
+          Tok = Tok->MatchingParen->Previous;
+        }
+        return Tok->isOneOf(Keywords.kw_pre, Keywords.kw_post,
+                            Keywords.kw_assert);
+      };
+      const bool MergeSingleContract =
+          !EndsContract(TheLine->Last) && EndsContract(NextLine.Last) &&
+          ThirdLine && !EndsContract(ThirdLine->Last);
+      if (MergeUnbracedParameterizedStatement || MergeSingleContract)
+        return tryMergeSimpleBlock(I, E, Limit);
+    }
+
     const auto *PreviousLine = I != AnnotatedLines.begin() ? I[-1] : nullptr;
     // Handle empty record blocks where the brace has already been wrapped.
     if (PreviousLine && TheLine->Last->is(tok::l_brace) &&
@@ -890,6 +915,47 @@ private:
         // is on a separate line.
         if (MergedLines > 0)
           ++MergedLines;
+      }
+      return MergedLines;
+    } else if (Line.InCpp2Declaration) {
+      const bool IsUnbracedParameterizedStatement =
+          Line.First->is(TT_FunctionTypeLParen) &&
+          I[1]->First->isNot(tok::l_brace);
+      const bool MergesWithSingleContract =
+          (I[1]->First->isOneOf(Keywords.kw_pre, Keywords.kw_post,
+                                Keywords.kw_assert) &&
+           I[1]->First->Next->isOneOf(tok::less, tok::l_paren)) ||
+          I[1]->First->isOneOf(tok::kw_requires,
+                               TT_Cpp2DeclarationBinaryOperator);
+      if (!IsUnbracedParameterizedStatement && !MergesWithSingleContract)
+        return 0;
+      const bool CouldBeShortDeclaration =
+          I[1]->First->is(TT_Cpp2DeclarationBinaryOperator) &&
+          I[1]->Last->is(tok::semi);
+      const bool CouldBeShort =
+          IsUnbracedParameterizedStatement || CouldBeShortDeclaration;
+      const bool EndsInComment = I[1]->Last->is(TT_LineComment);
+      if (!CouldBeShort && EndsInComment)
+        return 0;
+
+      const unsigned Delta = 1 + I[1]->Last->TotalLength;
+      if (Limit <= Delta || (Style.ColumnLimit == 0 && containsMustBreak(*I)))
+        return 0;
+      Limit -= Delta;
+      unsigned MergedLines = 0;
+      if (CouldBeShort &&
+          (!EndsInComment ? I[1]->Last->is(tok::semi)
+                          : (I[1]->Last->Previous &&
+                             I[1]->Last->Previous->is(tok::semi)))) {
+        return 1;
+      }
+      if (Style.AllowShortBlocksOnASingleLine != FormatStyle::SBS_Never) {
+        MergedLines = tryMergeSimpleBlock(I + 1, E, Limit);
+        // Count the merged the line.
+        if (MergedLines > 0)
+          ++MergedLines;
+        else
+          return MergesWithSingleContract;
       }
       return MergedLines;
     }

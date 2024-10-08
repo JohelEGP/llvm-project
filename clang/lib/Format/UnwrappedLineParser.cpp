@@ -20,6 +20,7 @@
 #include "TokenAnnotator.h"
 #include "clang/Basic/TokenKinds.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_os_ostream.h"
@@ -47,8 +48,7 @@ void printLine(llvm::raw_ostream &OS, const UnwrappedLine &Line,
       OS << Prefix;
       NewLine = false;
     }
-    OS << I->Tok->Tok.getName() << "["
-       << "T=" << (unsigned)I->Tok->getType()
+    OS << I->Tok->Tok.getName() << "[" << "T=" << (unsigned)I->Tok->getType()
        << ", OC=" << I->Tok->OriginalColumn << ", \"" << I->Tok->TokenText
        << "\"] ";
     for (SmallVectorImpl<UnwrappedLine>::const_iterator
@@ -67,6 +67,22 @@ void printLine(llvm::raw_ostream &OS, const UnwrappedLine &Line,
 LLVM_ATTRIBUTE_UNUSED static void printDebugInfo(const UnwrappedLine &Line) {
   printLine(llvm::dbgs(), Line);
 }
+
+// A class used to set and restore the Token position when peeking
+// ahead in the token source.
+class ScopedTokenPosition {
+  unsigned StoredPosition;
+
+protected:
+  FormatTokenSource *Tokens;
+
+public:
+  ScopedTokenPosition(FormatTokenSource *Tokens) : Tokens(Tokens) {
+    assert(Tokens && "Tokens expected to not be null");
+    StoredPosition = Tokens->getPosition();
+  }
+  ~ScopedTokenPosition() { Tokens->setPosition(StoredPosition); }
+};
 
 class ScopedDeclarationState {
 public:
@@ -112,6 +128,7 @@ public:
     Parser.Line->PPLevel = PreBlockLine->PPLevel;
     Parser.Line->InPPDirective = PreBlockLine->InPPDirective;
     Parser.Line->InMacroBody = PreBlockLine->InMacroBody;
+    Parser.Line->InCpp2Declaration = PreBlockLine->InCpp2Declaration;
     Parser.Line->UnbracedBodyLevel = PreBlockLine->UnbracedBodyLevel;
   }
 
@@ -748,6 +765,7 @@ FormatToken *UnwrappedLineParser::parseBlock(bool MustBeDeclaration,
                                              bool KeepBraces,
                                              IfStmtKind *IfKind,
                                              bool UnindentWhitesmithsBraces) {
+  const bool IsImplicitBlock = parsingCpp2ImplicitBlock();
   auto HandleVerilogBlockLabel = [this]() {
     // ":" name
     if (Style.isVerilog() && FormatTok->is(tok::colon)) {
@@ -761,7 +779,8 @@ FormatToken *UnwrappedLineParser::parseBlock(bool MustBeDeclaration,
   // module.
   const bool VerilogHierarchy =
       Style.isVerilog() && Keywords.isVerilogHierarchy(*FormatTok);
-  assert((FormatTok->isOneOf(tok::l_brace, TT_MacroBlockBegin) ||
+  assert((IsImplicitBlock ||
+          FormatTok->isOneOf(tok::l_brace, TT_MacroBlockBegin) ||
           (Style.isVerilog() &&
            (Keywords.isVerilogBegin(*FormatTok) || VerilogHierarchy))) &&
          "'{' or macro block token expected");
@@ -769,7 +788,8 @@ FormatToken *UnwrappedLineParser::parseBlock(bool MustBeDeclaration,
   const bool FollowedByComment = Tokens->peekNextToken()->is(tok::comment);
   auto Index = CurrentLines->size();
   const bool MacroBlock = FormatTok->is(TT_MacroBlockBegin);
-  FormatTok->setBlockKind(BK_Block);
+  if (!IsImplicitBlock)
+    FormatTok->setBlockKind(BK_Block);
 
   // For Whitesmiths mode, jump to the next level prior to skipping over the
   // braces.
@@ -784,7 +804,8 @@ FormatToken *UnwrappedLineParser::parseBlock(bool MustBeDeclaration,
   if (VerilogHierarchy) {
     AddLevels += parseVerilogHierarchyHeader();
   } else {
-    nextToken(/*LevelDifference=*/AddLevels);
+    if (!IsImplicitBlock)
+      nextToken(/*LevelDifference=*/AddLevels);
     HandleVerilogBlockLabel();
   }
 
@@ -815,7 +836,13 @@ FormatToken *UnwrappedLineParser::parseBlock(bool MustBeDeclaration,
     Line->Level += AddLevels;
 
   FormatToken *IfLBrace = nullptr;
-  const bool SimpleBlock = parseLevel(Tok, IfKind, &IfLBrace);
+  const bool SimpleBlock = [&]() {
+    if (Line->InCpp2Declaration) {
+      parseCpp2BlockBody();
+      return false;
+    }
+    return parseLevel(Tok, IfKind, &IfLBrace);
+  }();
 
   if (eof())
     return IfLBrace;
@@ -874,7 +901,8 @@ FormatToken *UnwrappedLineParser::parseBlock(bool MustBeDeclaration,
   size_t PPEndHash = computePPHash();
 
   // Munch the closing brace.
-  nextToken(/*LevelDifference=*/-AddLevels);
+  if (!IsImplicitBlock)
+    nextToken(/*LevelDifference=*/-AddLevels);
 
   // When this is a function block and there is an unnecessary semicolon
   // afterwards then mark it as optional (so the RemoveSemi pass can get rid of
@@ -990,7 +1018,10 @@ void UnwrappedLineParser::parseChildBlock() {
     ScopedDeclarationState DeclarationState(*Line, DeclarationScopeStack,
                                             /*MustBeDeclaration=*/false);
     Line->Level += SkipIndent ? 0 : 1;
-    parseLevel(OpeningBrace);
+    if (Line->InCpp2Declaration)
+      parseCpp2BlockBody();
+    else
+      parseLevel(OpeningBrace);
     flushComments(isOnNewLine(*FormatTok));
     Line->Level -= SkipIndent ? 0 : 1;
   }
@@ -1695,6 +1726,9 @@ void UnwrappedLineParser::parseStructuralElement(
     break;
   }
 
+  if (!OpeningBrace && Style.isCpp() && atCpp2TopLevelDeclaration())
+    return parseCpp2TopLevelDeclaration();
+
   for (const bool InRequiresExpression =
            OpeningBrace && OpeningBrace->is(TT_RequiresExpressionLBrace);
        !eof();) {
@@ -2141,6 +2175,1308 @@ void UnwrappedLineParser::parseStructuralElement(
       break;
     }
   }
+}
+
+namespace {
+
+// Stacks an object's value.
+template <class T> class [[nodiscard]] ScopedStackValue {
+  T *object;
+  T old_value;
+
+public:
+  ScopedStackValue(T &obj, const T new_value)
+      : object{&obj}, old_value{std::exchange(obj, new_value)} {}
+  ~ScopedStackValue() { *object = old_value; }
+};
+
+template <class T> ScopedStackValue(T &, T) -> ScopedStackValue<T>;
+
+} // namespace
+
+auto UnwrappedLineParser::Cpp2ParseContext::stackDeclarationOrStatement() {
+  return ScopedStackValue(Context, C::DeclOrStmt);
+}
+auto UnwrappedLineParser::Cpp2ParseContext::stackTemplateArgumentList() {
+  return ScopedStackValue(Context, C::TempArgList);
+}
+auto UnwrappedLineParser::Cpp2ParseContext::stackSomethingElse() {
+  return ScopedStackValue(Context, C::SomethingElse);
+}
+auto UnwrappedLineParser::Cpp2ParseContext::stack(
+    const Cpp2ParserFunction Parser) {
+  return ScopedStackValue(this->Parser, Parser);
+}
+
+/// \pre Same as \c UnwrappedLineParser::CurrentToken.
+using CurrentToken = const FormatToken *;
+
+static CurrentToken getNextNonComment(FormatTokenSource *Tokens) {
+  FormatToken *Tok = Tokens->getNextToken();
+  while (Tok->is(tok::comment) && !Tokens->isEOF())
+    Tok = Tokens->getNextToken();
+  return Tok;
+}
+
+static bool isCpp2DollarPunctuator(const FormatToken *const Tok) {
+  return Tok->TokenText == "$";
+}
+
+static bool startsCpp2Identifier(const FormatToken *const Tok) {
+  return Tok->Tok.getIdentifierInfo() && !isCpp2DollarPunctuator(Tok);
+}
+
+class UnwrappedLineParser::Cpp2FormatTokenSource : public FormatTokenSource {
+  FormatTokenSource *Cpp1Tokens;
+  FormatToken *UndoTok = nullptr;
+
+public:
+  Cpp2FormatTokenSource(FormatTokenSource *const Cpp1Tokens)
+      : Cpp1Tokens(Cpp1Tokens) {}
+
+  /// \returns The next lexed Cpp2 token.
+  FormatToken *getNextToken() override {
+    UndoTok = nullptr;
+    return nextAsIfLexedCpp2Token(Cpp1Tokens->getNextToken());
+  }
+
+  FormatToken *getPreviousToken() override {
+    return Cpp1Tokens->getPreviousToken();
+  }
+
+  FormatToken *peekNextToken(bool SkipComment = false) override {
+    // FIXME Apply the effects of `nextAsIfLexedCpp2Token`.
+    return Cpp1Tokens->peekNextToken(SkipComment);
+  }
+
+  bool isEOF() override { return Cpp1Tokens->isEOF(); }
+
+  unsigned getPosition() override { return Cpp1Tokens->getPosition(); }
+
+  FormatToken *setPosition(unsigned Position) override {
+    return Cpp1Tokens->setPosition(Position);
+  }
+
+  FormatToken *insertTokens(ArrayRef<FormatToken *> Tokens) override {
+    return Cpp1Tokens->insertTokens(Tokens);
+  }
+
+private:
+  static tok::TokenKind toTokenKind(const char c) {
+    static constexpr auto map = [] {
+      std::array<tok::TokenKind, 256> map = {};
+      map['<'] = tok::less;
+      map['%'] = tok::percent;
+      map[':'] = tok::colon;
+      map['>'] = tok::greater;
+      map['$'] = tok::dollar;
+      map['*'] = tok::star;
+      return map;
+    }();
+    return map[static_cast<unsigned>(c)];
+  }
+
+  // Splits off `N` characters from the end of `FormatTok` into tokens.
+  FormatToken *splitTokenBack(FormatToken *const FormatTok, unsigned N) {
+    const StringRef Text = FormatTok->TokenText;
+    llvm::SmallVector<FormatToken *, 2> Tokens = {};
+
+    for (unsigned i = 0; i != N; ++i) { // Allocate non-last tokens.
+      Tokens.push_back(new FormatToken);
+      Tokens[i]->copyFrom(*FormatTok);
+    }
+    Tokens.push_back(FormatTok); // `FormatTok` becomes the last token.
+
+    for (unsigned i = 0; i != N + 1; ++i) { // Adjust text-based properties.
+      FormatToken *const Tok = Tokens[i];
+      const auto AddedColumns = i == 0 ? 0 : Text.size() - N;
+      const auto NewText = Text.drop_front(AddedColumns).drop_back(N - i);
+      Tok->TokenText = NewText;
+      if (const auto Kind = toTokenKind(NewText.front());
+          NewText.size() == 1 && Kind != tok::unknown) {
+        Tok->Tok.setKind(Kind);
+      }
+      Tok->ColumnWidth = NewText.size();
+      Tok->OriginalColumn += AddedColumns;
+      if (i == 0)
+        continue;
+      const auto Loc =
+          Tokens[0]->Tok.getLocation().getLocWithOffset(AddedColumns);
+      Tok->Tok.setLocation(Loc);
+      Tok->WhitespaceRange = {Loc, Loc};
+    }
+
+    auto &New = Tokens; // Commit the new tokens.
+    (New.back() = new FormatToken)->Tok.setKind(tok::eof);
+    return Cpp1Tokens->insertTokens(New);
+  }
+
+  static bool isDigraph(const FormatToken *const Tok) {
+    return (Tok->is(tok::l_brace) && Tok->TokenText == "<%") ||
+           (Tok->is(tok::r_brace) && Tok->TokenText == "%>") ||
+           (Tok->is(tok::l_square) && Tok->TokenText == "<:") ||
+           (Tok->is(tok::r_square) && Tok->TokenText == ":>") ||
+           (Tok->is(tok::hash) && Tok->TokenText == "%:") ||
+           (Tok->is(tok::hashhash) && Tok->TokenText == "%:%:");
+  }
+
+  // `<:` and `%:` can appear in well-formed Cpp2.
+  FormatToken *splitDigraph(FormatToken *const FormatTok) {
+    if (isDigraph(FormatTok))
+      return splitTokenBack(FormatTok, FormatTok->TokenText.size() - 1);
+    return nullptr;
+  }
+
+  FormatToken *splitBackDollarOfIdentifier(FormatToken *const FormatTok) {
+    if (startsCpp2Identifier(FormatTok) && FormatTok->TokenText.back() == '$' &&
+        !isCpp2DollarPunctuator(FormatTok)) {
+      return splitTokenBack(FormatTok, 1);
+    }
+    return nullptr;
+  }
+
+  FormatToken *splitArrowStar(FormatToken *const FormatTok) {
+    if (!FormatTok->is(tok::arrowstar))
+      return nullptr;
+    FormatToken *const arrow = splitTokenBack(FormatTok, 1);
+    arrow->Tok.setKind(tok::arrow);
+    return arrow;
+  }
+
+  static bool isReclaimedIdentifier(const FormatToken *const FormatTok) {
+    // Undo changes that can spill to Cpp1 code in the destructor.
+    return FormatTok->isOneOf(tok::kw_new, tok::kw_struct, tok::kw_class,
+                              tok::kw_enum, tok::kw_union) ||
+           llvm::is_contained({"and", "and_eq", "bitand", "bitor", "compl",
+                               "not", "not_eq", "or", "or_eq", "xor", "xor_eq"},
+                              FormatTok->TokenText);
+  }
+
+  FormatToken *nextAsIfLexedCpp2Token(FormatToken *const FormatTok) {
+    if (const auto Tok = splitDigraph(FormatTok))
+      return Tok;
+    if (const auto Tok = splitBackDollarOfIdentifier(FormatTok))
+      return Tok;
+    if (const auto Tok = splitArrowStar(FormatTok))
+      return Tok;
+
+    if (isCpp2DollarPunctuator(FormatTok)) {
+      FormatTok->Tok.setKind(tok::dollar);
+      FormatTok->Tok.setIdentifierInfo(nullptr);
+    } else if (isReclaimedIdentifier(FormatTok)) {
+      FormatTok->Tok.setKind(tok::identifier);
+      UndoTok = FormatTok;
+    }
+    return FormatTok;
+  }
+
+public:
+  ~Cpp2FormatTokenSource() {
+    if (!UndoTok)
+      return;
+    if (UndoTok->is(tok::identifier)) {
+      if (UndoTok->TokenText == "struct")
+        UndoTok->Tok.setKind(tok::kw_struct);
+      else if (UndoTok->TokenText == "class")
+        UndoTok->Tok.setKind(tok::kw_class);
+      else if (UndoTok->TokenText == "enum")
+        UndoTok->Tok.setKind(tok::kw_enum);
+      else if (UndoTok->TokenText == "union")
+        UndoTok->Tok.setKind(tok::kw_union);
+    }
+  }
+};
+
+template <CurrentToken (*Increment)(FormatTokenSource *)>
+struct UnwrappedLineParser::CurrentTokenIterator {
+  CurrentToken Tok;
+  FormatTokenSource *Tokens;
+
+  CurrentToken operator*() const { return Tok; }
+  CurrentToken operator->() const { return Tok; }
+  CurrentToken operator++(int) { return std::exchange(Tok, Increment(Tokens)); }
+};
+
+bool UnwrappedLineParser::parseCpp2Token(const Cpp2TokenToParse IsArg,
+                                         const TokenType Type) {
+  return parseCpp2Token(ArrayRef{IsArg}, Type);
+}
+
+bool UnwrappedLineParser::parseCpp2Token(
+    const ArrayRef<Cpp2TokenToParse> IsArgs, const TokenType Type) {
+  const auto Is = [&](const auto Is) {
+    if constexpr (std::is_same_v<const Cpp2AtFunction, decltype(Is)>) {
+      if (!(this->*Is)(FormatTok))
+        return false;
+    } else {
+      if (FormatTok->isNot(Is))
+        return false;
+    }
+    if (Type != TT_Unknown) {
+      FormatTok->setFinalizedType(Type);
+    } else if constexpr (std::is_same_v<const IdentifierInfo *const,
+                                        decltype(Is)>) {
+      FormatTok->setFinalizedType(TT_Cpp2Keyword);
+    }
+    nextToken();
+    return true;
+  };
+  for (const auto IsVar : IsArgs)
+    if (std::visit(Is, IsVar))
+      return true;
+  return false;
+}
+
+/// \brief Calls \c Parser and returns whether it parsed a token.
+bool UnwrappedLineParser::parsesCpp2(const Cpp2ParserFunction Parser) {
+  const FormatToken *const Before = FormatTok;
+  (this->*Parser)();
+  return FormatTok != Before;
+}
+
+static bool isCpp2OpeningPunctuator(const FormatToken *const Tok,
+                                    const tok::TokenKind Kind) {
+  if (Kind != tok::unknown)
+    return Tok->is(Kind);
+  return Tok->isOneOf(tok::less, tok::l_paren, tok::l_square, tok::l_brace);
+}
+
+static tok::TokenKind getCpp2ClosingPunctuator(const FormatToken *const Tok) {
+  switch (Tok->Tok.getKind()) {
+  default:
+    assert(false && "Not an opening punctuator.");
+  case tok::less:
+    return tok::greater;
+  case tok::l_paren:
+    return tok::r_paren;
+  case tok::l_square:
+    return tok::r_square;
+  case tok::l_brace:
+    return tok::r_brace;
+  }
+}
+
+static void matchCpp2PunctuatorTypes(const FormatToken *const Opener,
+                                     FormatToken *const Closer) {
+  switch (Opener->getType()) {
+  case TT_TemplateOpener:
+    return Closer->setFinalizedType(TT_TemplateCloser);
+  case TT_AttributeSquare:
+    return Closer->setFinalizedType(TT_AttributeSquare);
+  default:
+    return;
+  }
+}
+
+static void matchCpp2Punctuators(FormatToken *const Opener,
+                                 FormatToken *const Closer) {
+  matchCpp2PunctuatorTypes(Opener, Closer);
+
+  Opener->MatchingParen = Closer;
+  Closer->MatchingParen = Opener;
+}
+
+[[nodiscard]] auto UnwrappedLineParser::setupCpp2BalancedPunctuatorsFormatting(
+    const TokenType OpenerType, const tok::TokenKind CloserKind) {
+  FormatToken *const Opener = FormatTok;
+
+  if (OpenerType != TT_Unknown)
+    Opener->setFinalizedType(OpenerType);
+
+  nextToken();
+
+  return llvm::make_scope_exit([=]() {
+    FormatToken *const Closer = FormatTok;
+
+    if (!parseCpp2Token(CloserKind)) {
+      if (OpenerType == TT_TemplateOpener)
+        Opener->setFinalizedType(TT_BinaryOperator);
+      return;
+    }
+
+    matchCpp2Punctuators(Opener, Closer);
+
+    if (Closer->is(TT_AttributeSquare)) {
+      Closer->EndsCppAttributeGroup = true;
+      Closer->Previous->EndsCppAttributeGroup = false;
+    }
+  });
+}
+
+void UnwrappedLineParser::parseCpp2BalancedPunctuators(
+    const Cpp2Punctuator Opener, const Cpp2ParserFunction Parser) {
+  if (!isCpp2OpeningPunctuator(FormatTok, Opener.Kind))
+    return;
+  assert(FormatTok->isNot(tok::l_brace) && "Call `parseCpp2Block` instead.");
+  const tok::TokenKind Closer = getCpp2ClosingPunctuator(FormatTok);
+  const auto _ = setupCpp2BalancedPunctuatorsFormatting(Opener.Type, Closer);
+  parseCpp2Until(Closer, Parser);
+}
+
+void UnwrappedLineParser::parseCpp2Until(const tok::TokenKind Kind,
+                                         const Cpp2ParserFunction Parser) {
+  while (FormatTok->isNot(Kind))
+    if (!parsesCpp2(Parser))
+      return;
+}
+
+void UnwrappedLineParser::parseCpp2BlockBody() {
+  const auto _ = Cpp2Context.stackDeclarationOrStatement();
+  const Cpp2ParserFunction Parser = Cpp2Context.getParser();
+  if (Parser == &UnwrappedLineParser::parseCpp2ContractSeq)
+    parseCpp2ContractSeq();
+  else
+    parseCpp2Until(tok::r_brace, Parser);
+}
+
+bool UnwrappedLineParser::parsingCpp2ImplicitBlock() const {
+  return Cpp2Context.getParser() == &UnwrappedLineParser::parseCpp2ContractSeq;
+}
+
+void UnwrappedLineParser::parseCpp2Block(const Cpp2ParserFunction Parser) {
+  const auto _ = Cpp2Context.stack(Parser);
+  if (!parsingCpp2ImplicitBlock() && !FormatTok->is(tok::l_brace))
+    return;
+  if (Cpp2Context.isDeclarationOrStatement()) {
+    parseBlock(/*MustBeDeclaration=*/false, /*AddLevels=*/1,
+               /*MuchSemi=*/false, /*KeepBraces=*/true,
+               /*IfStmtKind=*/nullptr, /*UnindentWhitesmithsBraces=*/false);
+  } else {
+    parseChildBlock();
+  }
+}
+
+template <UnwrappedLineParser::Cpp2ParserFunction Parser>
+void UnwrappedLineParser::parseCommaSeparatedCpp2() {
+  parseCpp2Token(tok::comma);
+  (this->*Parser)();
+}
+
+void UnwrappedLineParser::parseCpp2DeclarationColon() {
+  parseCpp2Token(tok::colon, TT_Cpp2DeclarationColon);
+}
+
+void UnwrappedLineParser::parseCpp2Semi() {
+  if (Cpp2Context.isDeclarationOrStatement() && parseCpp2Token(tok::semi))
+    return addUnwrappedLine();
+  const FormatToken *const Next = Tokens->peekNextToken(/*SkipComment=*/true);
+  if (Next->isOneOf(tok::l_paren, tok::r_paren, tok::r_square, tok::comma,
+                    Keywords.kw_is, Keywords.kw_as)) {
+    parseCpp2Token(tok::semi); // Simple IIFE support, e.g. `:() -> _ = 0;()`.
+  }
+}
+
+void UnwrappedLineParser::parseCpp2Literal() {
+  while (FormatTok->isStringLiteral())
+    nextToken();
+  if (FormatTok->Tok.isLiteral())
+    nextToken();
+}
+
+void UnwrappedLineParser::parseCpp2MultiTokenType() {
+  while (FormatTok->Tok.isSimpleTypeSpecifier(LangOpts))
+    nextToken();
+}
+
+bool UnwrappedLineParser::isCpp2SingleTokenOperator(
+    const CurrentToken Tok) const {
+  const auto IsOperatorKeyword = [&](const CurrentToken Tok) {
+    return Tok->isOneOf(Keywords.kw_is, Keywords.kw_as);
+  };
+
+  switch (Tok->Tok.getKind()) {
+  case tok::slashequal:
+  case tok::slash:
+  case tok::lesslessequal:
+  case tok::lessless:
+  case tok::spaceship:
+  case tok::lessequal:
+  case tok::less:
+  case tok::greatergreaterequal:
+  case tok::greatergreater:
+  case tok::greaterequal:
+  case tok::greater:
+  case tok::plusplus:
+  case tok::plusequal:
+  case tok::plus:
+  case tok::minusminus:
+  case tok::minusequal:
+  case tok::arrow:
+  case tok::minus:
+  case tok::pipepipe:
+  case tok::pipeequal:
+  case tok::pipe:
+  case tok::ampamp:
+  case tok::ampequal:
+  case tok::amp:
+  case tok::starequal:
+  case tok::star:
+  case tok::percentequal:
+  case tok::percent:
+  case tok::caretequal:
+  case tok::caret:
+  case tok::tilde:
+  case tok::equalequal:
+  case tok::equal:
+  case tok::exclaimequal:
+  case tok::exclaim:
+    return true;
+  default:
+    return IsOperatorKeyword(Tok);
+  }
+}
+
+int UnwrappedLineParser::atCpp2IdentifierTokens(CurrentToken Tok) {
+  if (!startsCpp2Identifier(Tok))
+    return 0;
+  if (!FormatTok->is(tok::kw_operator))
+    return 1;
+  const ScopedTokenPosition _(Tokens);
+  Tok = getNextNonComment(Tokens);
+  if (isCpp2SingleTokenOperator(Tok))
+    return 2; // `operator` _token_.
+  if (Tok->is(tok::l_paren)) {
+    if (getNextNonComment(Tokens)->is(tok::r_paren))
+      return 3; // `operator()`.
+  } else if (Tok->is(tok::l_square)) {
+    if (getNextNonComment(Tokens)->is(tok::r_square))
+      return 3; // `operator[]`.
+  }
+  return 1; // `operator`.
+}
+
+bool UnwrappedLineParser::parseCpp2Identifier() {
+  const int TotalTokens = atCpp2IdentifierTokens(FormatTok);
+  if (TotalTokens == 0)
+    return false;
+  int ParsedTokens = parseCpp2Token(tok::kw_operator);
+  if (ParsedTokens == 0) {
+    FormatTok->setFinalizedType(TT_Cpp2Identifier);
+    nextToken();
+  } else {
+    while (ParsedTokens++ != TotalTokens) {
+      FormatTok->setFinalizedType(TT_OverloadedOperator);
+      nextToken();
+    }
+    if (FormatTok->is(tok::l_paren))
+      FormatTok->setFinalizedType(TT_OverloadedOperatorLParen);
+  }
+  return true;
+}
+
+void UnwrappedLineParser::parseCpp2TypeQualifierSeq() {
+  while (parseCpp2Token(tok::kw_const) ||
+         parseCpp2Token(tok::star, TT_PointerOrReference)) {
+    continue;
+  }
+}
+
+void UnwrappedLineParser::parseCpp2TypeId() {
+  const bool parsedTypeQualifierSeq =
+      parsesCpp2(&UnwrappedLineParser::parseCpp2TypeQualifierSeq);
+  parseCpp2IdExpression();
+  parseCpp2FunctionType(parsedTypeQualifierSeq ? Cpp2ListOf::Undecided
+                                               : Cpp2ListOf::Declarations);
+  parseCpp2IsAsExpressionTarget();
+}
+
+void UnwrappedLineParser::parseCpp2TemplateArgument() {
+  if (!parsesCpp2(&UnwrappedLineParser::parseCpp2Expression))
+    parseCpp2TypeId();
+}
+
+bool UnwrappedLineParser::atCpp2TemplateArgumentList(const CurrentToken Tok) {
+  if (Tok->hasWhitespaceBefore())
+    return false;
+  const Cpp2ListOf List = atCpp2TemplateParameterDeclarationList(Tok);
+  return List == Cpp2ListOf::Undecided || List == Cpp2ListOf::Expressions;
+}
+
+void UnwrappedLineParser::parseCpp2TemplateArgumentList() {
+  if (!atCpp2TemplateArgumentList(FormatTok))
+    return;
+  const auto _ = Cpp2Context.stackTemplateArgumentList();
+  parseCpp2BalancedPunctuators(
+      {tok::less, TT_TemplateOpener},
+      &UnwrappedLineParser::parseCommaSeparatedCpp2<
+          &UnwrappedLineParser::parseCpp2TemplateArgument>);
+}
+
+void UnwrappedLineParser::parseCpp2UnqualifiedId() {
+  if (parsesCpp2(&UnwrappedLineParser::parseCpp2MultiTokenType))
+    return;
+  if (parseCpp2Identifier())
+    parseCpp2TemplateArgumentList();
+  else
+    parseCpp2Token(tok::ellipsis);
+}
+
+void UnwrappedLineParser::parseCpp2IdExpression() {
+  parseCpp2Token(tok::coloncolon);
+  while (parsesCpp2(&UnwrappedLineParser::parseCpp2UnqualifiedId) &&
+         parseCpp2Token({tok::coloncolon, tok::period})) {
+    continue;
+  }
+}
+
+void UnwrappedLineParser::parseCpp2ExpressionList() {
+  const auto _ = Cpp2Context.stackSomethingElse();
+  parseCpp2BalancedPunctuators(
+      {{},
+       FormatTok->is(tok::l_square) ? TT_ArraySubscriptLSquare : TT_Unknown},
+      &UnwrappedLineParser::parseCommaSeparatedCpp2<
+          &UnwrappedLineParser::parseCpp2Expression>);
+}
+
+void UnwrappedLineParser::parseCpp2PrimaryExpression() {
+  switch (FormatTok->Tok.getKind()) {
+  default:
+    if (FormatTok->is(Keywords.kw_inspect))
+      return parseCpp2InspectExpression();
+    parseCpp2IdExpression();
+    parseCpp2Literal();
+    return;
+  case tok::l_paren:
+    return parseCpp2ExpressionList();
+  case tok::colon:
+    return parseCpp2UnnamedDeclaration();
+  }
+}
+
+bool UnwrappedLineParser::atCpp2PostfixOperator(const CurrentToken Tok) const {
+  if (Tok->isOneOf(tok::plusplus, tok::minusminus, tok::tilde, tok::dollar,
+                   tok::ellipsis, tok::periodperiodequal,
+                   tok::periodperiodless))
+    return true;
+  if (Tok->isOneOf(tok::star, tok::amp)) {
+    FormatToken *const Next = Tokens->peekNextToken(/*SkipComment=*/true);
+    return !Next->is(tok::l_paren) && !startsCpp2Identifier(Next) &&
+           !tok::isLiteral(Next->Tok.getKind());
+  }
+  return false;
+}
+
+bool UnwrappedLineParser::parseCpp2PostfixOperator() {
+  return parseCpp2Token(&UnwrappedLineParser::atCpp2PostfixOperator,
+                        TT_Cpp2PostfixOperator);
+}
+
+void UnwrappedLineParser::parseCpp2PostfixExpression() {
+  if (!parsesCpp2(&UnwrappedLineParser::parseCpp2PrimaryExpression))
+    return;
+  while (!eof()) {
+    switch (FormatTok->Tok.getKind()) {
+    default:
+      if (parseCpp2PostfixOperator())
+        continue;
+      return;
+    case tok::l_square:
+    case tok::l_paren:
+      parseCpp2ExpressionList();
+      continue;
+    case tok::period:
+      nextToken();
+      parseCpp2IdExpression();
+      continue;
+    case tok::periodperiodequal:
+    case tok::periodperiodless:
+      nextToken();
+      parseCpp2PostfixExpression();
+      continue;
+    }
+  }
+}
+
+bool UnwrappedLineParser::atCpp2ParameterDirection(
+    const CurrentToken Tok) const {
+  const FormatToken *const Next = Tokens->peekNextToken(/*SkipComment=*/true);
+  return llvm::is_contained({Keywords.kw_in, Keywords.kw_copy,
+                             Keywords.kw_inout, Keywords.kw_out,
+                             Keywords.kw_move, Keywords.kw_forward},
+                            Tok->Tok.getIdentifierInfo()) &&
+         (startsCpp2Identifier(Next) || Next->is(tok::colon));
+}
+
+bool UnwrappedLineParser::parseCpp2ParameterDirection() {
+  return parseCpp2Token(&UnwrappedLineParser::atCpp2ParameterDirection,
+                        TT_Cpp2Keyword);
+}
+
+bool UnwrappedLineParser::parseCpp2PrefixOperator() {
+  return parseCpp2Token({tok::exclaim, tok::minus, tok::plus},
+                        TT_UnaryOperator) ||
+         parseCpp2ParameterDirection();
+}
+
+void UnwrappedLineParser::parseCpp2PrefixExpression() {
+  while (parseCpp2PrefixOperator())
+    continue;
+  parseCpp2PostfixExpression();
+}
+
+void UnwrappedLineParser::parseCpp2IsAsExpressionTarget() {
+  if (parseCpp2Token({Keywords.kw_is, Keywords.kw_as}) &&
+      !parsesCpp2(&UnwrappedLineParser::parseCpp2TypeId)) {
+    parseCpp2Expression();
+  }
+}
+
+void UnwrappedLineParser::parseCpp2IsAsExpression() {
+  parseCpp2PrefixExpression();
+  parseCpp2IsAsExpressionTarget();
+}
+
+bool UnwrappedLineParser::atCpp2BinaryOperator(const CurrentToken Tok,
+                                               const prec::Level Min) const {
+  const prec::Level Cpp1Precedence = Tok->getPrecedence();
+  switch (Cpp1Precedence) {
+  case prec::Conditional:
+  case prec::Comma:
+  case prec::PointerToMember:
+    return false;
+  case prec::Assignment:
+    if (!llvm::is_contained({"<<=", ">>="}, Tok->TokenText))
+      break;
+    [[fallthrough]];
+  case prec::Relational:
+  case prec::Shift:
+    if (Cpp2Context.isTemplateArgumentList())
+      return false;
+    break;
+  default:
+    break;
+  }
+  return Cpp1Precedence >= Min;
+}
+
+bool UnwrappedLineParser::parseCpp2BinaryOperator(const prec::Level Min) {
+  if (atCpp2BinaryOperator(FormatTok, Min)) {
+    FormatTok->setFinalizedType(TT_BinaryOperator);
+    nextToken();
+    return true;
+  }
+  return false;
+}
+
+void UnwrappedLineParser::parseCpp2BinaryExpression(const prec::Level Min) {
+  while (parsesCpp2(&UnwrappedLineParser::parseCpp2IsAsExpression) &&
+         parseCpp2BinaryOperator(Min)) {
+    continue;
+  }
+}
+
+void UnwrappedLineParser::parseCpp2LogicalOrExpression() {
+  parseCpp2BinaryExpression(prec::LogicalOr);
+}
+
+void UnwrappedLineParser::parseCpp2AssignmentExpression() {
+  parseCpp2BinaryExpression(prec::Assignment);
+}
+
+void UnwrappedLineParser::parseCpp2Expression() {
+  parseCpp2AssignmentExpression();
+}
+
+bool UnwrappedLineParser::atCpp2AltName(const CurrentToken Tok) const {
+  return startsCpp2Identifier(Tok) &&
+         Tokens->peekNextToken(/*SkipComment=*/true)->is(tok::colon);
+}
+
+void UnwrappedLineParser::parseCpp2AltName() {
+  if (atCpp2AltName(FormatTok)) {
+    parseCpp2Identifier();
+    parseCpp2DeclarationColon();
+  }
+}
+
+void UnwrappedLineParser::parseCpp2Alternative() {
+  const auto _ = Cpp2Context.stackDeclarationOrStatement();
+  parseCpp2AltName();
+  parseCpp2IsAsExpressionTarget();
+  parseCpp2Token(tok::equal);
+  parseCpp2Statement();
+}
+
+auto UnwrappedLineParser::setupCpp2InspectExpressionFormatting() {
+  const bool ParseLine =
+      FormatTok && !FormatTok->getPreviousNonComment()->getPreviousNonComment();
+  return llvm::make_scope_exit(
+      [=, _ = ParseLine ? Cpp2Context.stackDeclarationOrStatement()
+                        : Cpp2Context.stackSomethingElse()]() {
+        if (ParseLine)
+          addUnwrappedLine();
+      });
+}
+
+void UnwrappedLineParser::parseCpp2InspectExpression() {
+  if (!parseCpp2Token(Keywords.kw_inspect))
+    return;
+  const auto _ = setupCpp2InspectExpressionFormatting();
+  parseCpp2Token(tok::kw_constexpr);
+  parseCpp2Expression();
+  parseCpp2ReturnList();
+  parseCpp2Block(&UnwrappedLineParser::parseCpp2Alternative);
+}
+
+auto UnwrappedLineParser::setupCpp2CompoundStatementFormatting() {
+  const bool IsDoIterationStatement =
+      FormatTok->Previous && FormatTok->Previous->is(tok::kw_do);
+  return llvm::make_scope_exit([=]() {
+    if (Cpp2Context.isDeclarationOrStatement() && !IsDoIterationStatement)
+      addUnwrappedLine();
+  });
+}
+
+void UnwrappedLineParser::parseCpp2CompoundStatement() {
+  const auto _ = setupCpp2CompoundStatementFormatting();
+  parseCpp2Block(&UnwrappedLineParser::parseCpp2Statement);
+}
+
+void UnwrappedLineParser::parseCpp2SelectionStatement() {
+  const auto _ = Cpp2Context.stack(&UnwrappedLineParser::parseCpp2Statement);
+  parseIfThenElse(/*IfStmtKind=*/nullptr, /*KeepBraces=*/true);
+}
+
+void UnwrappedLineParser::parseCpp2UsingStatement() {
+  if (parseCpp2Token(tok::kw_using)) {
+    parseCpp2IdExpression();
+    parseCpp2Semi();
+  }
+}
+
+void UnwrappedLineParser::parseCpp2ReturnStatement() {
+  if (parseCpp2Token(tok::kw_return)) {
+    parseCpp2Expression();
+    parseCpp2Semi();
+  }
+}
+
+void UnwrappedLineParser::parseCpp2JumpStatement() {
+  if (parseCpp2Token({tok::kw_break, tok::kw_continue})) {
+    parseCpp2Identifier();
+    parseCpp2Semi();
+  }
+}
+
+void UnwrappedLineParser::parseCpp2NextClause() {
+  if (parseCpp2Token(Keywords.kw_next))
+    parseCpp2AssignmentExpression();
+}
+
+void UnwrappedLineParser::parseCpp2WhileStatement() {
+  if (parseCpp2Token(tok::kw_while)) {
+    parseCpp2LogicalOrExpression();
+    parseCpp2NextClause();
+    parseCpp2CompoundStatement();
+  }
+}
+
+void UnwrappedLineParser::parseCpp2DoStatement() {
+  if (parseCpp2Token(tok::kw_do)) {
+    parseCpp2CompoundStatement();
+    parseCpp2Token(tok::kw_while);
+    parseCpp2LogicalOrExpression();
+    parseCpp2NextClause();
+    parseCpp2Semi();
+  }
+}
+
+bool UnwrappedLineParser::atCpp2ParameterizedStatement(CurrentToken Tok) {
+  return atCpp2ParameterDeclarationList(Tok) == Cpp2ListOf::Declarations;
+}
+
+void UnwrappedLineParser::parseCpp2ParameterizedStatement() {
+  parseCpp2ParameterDeclarationList();
+  if (FormatTok->is(tok::l_brace))
+    parseCpp2Statement();
+  else
+    parseUnbracedBody();
+}
+
+void UnwrappedLineParser::parseCpp2ForStatement() {
+  if (parseCpp2Token(tok::kw_for)) {
+    parseCpp2Expression();
+    parseCpp2NextClause();
+    parseCpp2Token(tok::kw_do);
+    parseCpp2ParameterizedStatement();
+  }
+}
+
+bool UnwrappedLineParser::atCpp2LabelIdentifier(const CurrentToken Tok) {
+  const ScopedTokenPosition _(Tokens);
+  return startsCpp2Identifier(Tok) &&
+         getNextNonComment(Tokens)->is(tok::colon) &&
+         getNextNonComment(Tokens)->isOneOf(tok::kw_while, tok::kw_do,
+                                            tok::kw_for);
+}
+
+bool UnwrappedLineParser::parseCpp2Label() {
+  if (!atCpp2LabelIdentifier(FormatTok))
+    return false;
+  parseCpp2Identifier();
+  FormatToken *const Colon = FormatTok;
+  parseLabel(!Style.IndentGotoLabels);
+  Colon->setFinalizedType(TT_GotoLabelColon);
+  return true;
+}
+
+void UnwrappedLineParser::parseCpp2IterationStatementWithoutLabel() {
+  if (FormatTok->is(tok::kw_while))
+    parseCpp2WhileStatement();
+  else if (FormatTok->is(tok::kw_do))
+    parseCpp2DoStatement();
+  else if (FormatTok->is(tok::kw_for))
+    parseCpp2ForStatement();
+}
+
+void UnwrappedLineParser::parseCpp2ExpressionStatement() {
+  parseCpp2Expression();
+  parseCpp2Semi();
+}
+
+bool UnwrappedLineParser::atCpp2Contract(const CurrentToken Tok) const {
+  return Tok->isOneOf(Keywords.kw_pre, Keywords.kw_post, Keywords.kw_assert) &&
+         Tokens->peekNextToken(/*SkipComment=*/true)
+             ->isOneOf(tok::less, tok::l_paren);
+}
+
+void UnwrappedLineParser::parseCpp2Contract() {
+  const auto _ = Cpp2Context.stackSomethingElse();
+  parseCpp2IdExpression();
+  parseCpp2PrimaryExpression();
+  if (FormatTok->isNot(tok::semi))
+    addUnwrappedLine();
+}
+
+void UnwrappedLineParser::parseCpp2ContractStatement() {
+  parseCpp2Contract();
+  parseCpp2Semi();
+}
+
+void UnwrappedLineParser::parseCpp2Statement() {
+  switch (FormatTok->Tok.getKind()) {
+  case tok::kw_if:
+    return parseCpp2SelectionStatement();
+  case tok::kw_using:
+    return parseCpp2UsingStatement();
+  case tok::kw_return:
+    return parseCpp2ReturnStatement();
+  case tok::kw_break:
+  case tok::kw_continue:
+    return parseCpp2JumpStatement();
+  case tok::kw_while:
+  case tok::kw_do:
+  case tok::kw_for:
+    return parseCpp2IterationStatementWithoutLabel();
+  case tok::l_brace:
+    return parseCpp2CompoundStatement();
+  default:
+    if (atCpp2Contract(FormatTok))
+      return parseCpp2ContractStatement();
+    if (FormatTok->is(Keywords.kw_inspect))
+      return parseCpp2InspectExpression();
+    if (parseCpp2Label())
+      return parseCpp2IterationStatementWithoutLabel();
+    if (atCpp2Declaration())
+      return parseCpp2Declaration();
+    [[fallthrough]];
+  case tok::l_paren:
+    if (atCpp2ParameterizedStatement(FormatTok))
+      return parseCpp2ParameterizedStatement();
+    return parseCpp2ExpressionStatement();
+  }
+}
+
+void UnwrappedLineParser::parseCpp2MetaFunctionsList() {
+  while (parseCpp2Token(tok::at) &&
+         parsesCpp2(&UnwrappedLineParser::parseCpp2IdExpression)) {
+    continue;
+  }
+}
+
+bool UnwrappedLineParser::precedesCpp2Identifier(const CurrentToken) const {
+  return startsCpp2Identifier(Tokens->peekNextToken(/*SkipComment=*/true));
+}
+
+bool UnwrappedLineParser::atCpp2ThisSpecifier(const CurrentToken Tok) const {
+  return Tok->isOneOf(Keywords.kw_implicit, tok::kw_virtual,
+                      Keywords.kw_override, Keywords.kw_final) &&
+         precedesCpp2Identifier(Tok);
+}
+
+void UnwrappedLineParser::parseCpp2ThisSpecifier() {
+  parseCpp2Token(&UnwrappedLineParser::atCpp2ThisSpecifier, TT_Cpp2Keyword);
+}
+
+namespace {
+
+struct Cpp2ParameterDeclaration {
+  const FormatToken *ThisSpecifier = nullptr;
+  const FormatToken *ParameterDirection = nullptr;
+  const FormatToken *Identifier = nullptr;
+  const FormatToken *Colon = nullptr;
+  CurrentToken Tok = nullptr;
+};
+
+} // namespace
+
+auto UnwrappedLineParser::atCpp2ParameterDeclarationHead(CurrentToken Tok) {
+  Cpp2ParameterDeclaration Res;
+  CurrentTokenIterator<getNextNonComment> It{std::exchange(Tok, nullptr),
+                                             Tokens};
+  if (atCpp2ThisSpecifier(*It))
+    Res.ThisSpecifier = It++;
+  if (atCpp2ParameterDirection(*It))
+    Res.ParameterDirection = It++;
+  if (startsCpp2Identifier(*It))
+    Res.Identifier = It++;
+  if (It->is(tok::ellipsis))
+    It++;
+  if (It->is(tok::colon))
+    Res.Colon = It++;
+  Res.Tok = It.Tok;
+  return Res;
+}
+
+void UnwrappedLineParser::parseCpp2ParameterDeclaration() {
+  parseCpp2ThisSpecifier();
+  parseCpp2ParameterDirection();
+  parseCpp2Declaration();
+  parseCpp2Identifier();
+}
+
+bool UnwrappedLineParser::skipCpp2BalancedTokens(CurrentToken &Tok) {
+  if (!isCpp2OpeningPunctuator(Tok, tok::unknown))
+    return false;
+  const auto Closer = getCpp2ClosingPunctuator(Tok);
+  do {
+    Tok = getNextNonComment(Tokens);
+    if (isCpp2OpeningPunctuator(Tok, tok::unknown))
+      skipCpp2BalancedTokens(Tok);
+  } while (!Tok->isOneOf(Closer, tok::eof));
+  if (Tok->is(Closer))
+    Tok = getNextNonComment(Tokens);
+  return true;
+}
+
+auto UnwrappedLineParser::skipCpp2DeclarationSignature(
+    CurrentToken Tok, const tok::TokenKind Closer) -> CurrentToken {
+  while (!Tok->isOneOf(Closer, tok::eof, tok::comma)) {
+    if (skipCpp2BalancedTokens(Tok))
+      continue;
+    Tok = getNextNonComment(Tokens);
+  }
+  return Tok;
+}
+
+auto UnwrappedLineParser::atCpp2ParameterDeclarationSeq(
+    CurrentToken Tok, const tok::TokenKind Opener) -> Cpp2ListOf {
+  if (Tok->isNot(Opener))
+    return Cpp2ListOf::NotAList;
+
+  const ScopedTokenPosition _(Tokens);
+  const tok::TokenKind Closer = getCpp2ClosingPunctuator(Tok);
+  Tok = getNextNonComment(Tokens);
+
+  while (!Tok->isOneOf(Closer, tok::eof)) {
+    const Cpp2ParameterDeclaration Res = atCpp2ParameterDeclarationHead(Tok);
+
+    // No parameter declaration parsed. Can only be a list of expressions.
+    if (Tok == Res.Tok)
+      return Cpp2ListOf::Expressions;
+    Tok = Res.Tok;
+
+    if (Res.Identifier) {
+      if (Res.ThisSpecifier || Res.Colon)
+        return Cpp2ListOf::Declarations;
+
+      if (Res.ParameterDirection) {
+        if (Tok->is(tok::comma))
+          Tok = getNextNonComment(Tokens);
+        continue; // Could be an expression, still undecided.
+      }
+
+      // Just the identifier.
+
+      if (Res.Tok->is(tok::comma)) {
+        // In angles, we're still undecided.
+        Tok = getNextNonComment(Tokens);
+        continue;
+      }
+
+      if (Res.Tok->isOneOf(Closer, tok::eof))
+        break;
+
+      // Anything else after the identifier can only happen in an expression.
+      return Cpp2ListOf::Expressions;
+    }
+
+    assert(!Res.ThisSpecifier);
+    assert(Res.Colon);
+
+    if (Res.ParameterDirection)
+      return Cpp2ListOf::Declarations;
+
+    // Just the colon.
+
+    if (Res.Tok->isOneOf(Closer, tok::eof))
+      break;
+
+    if (!startsCpp2Identifier(Res.Tok))
+      return Cpp2ListOf::Expressions;
+
+    if (startsCpp2Identifier(Res.Tok) && Opener == tok::less)
+      continue;
+
+    Tok = skipCpp2DeclarationSignature(Tok, Closer);
+  }
+
+  if (Tok->is(Closer)) {
+    if (Tokens->peekNextToken(/*SkipComment=*/true)->is(tok::arrow))
+      return Cpp2ListOf::Declarations;
+    return Cpp2ListOf::Undecided;
+  }
+  return Cpp2ListOf::NotAList;
+}
+
+void UnwrappedLineParser::parseCpp2ParameterDeclarationSeq(
+    const Cpp2Punctuator Opener) {
+  const auto _ = Cpp2Context.stackSomethingElse();
+  parseCpp2BalancedPunctuators(
+      Opener, &UnwrappedLineParser::parseCommaSeparatedCpp2<
+                  &UnwrappedLineParser::parseCpp2ParameterDeclaration>);
+}
+
+auto UnwrappedLineParser::atCpp2TemplateParameterDeclarationList(
+    const CurrentToken Tok) -> Cpp2ListOf {
+  return atCpp2ParameterDeclarationSeq(Tok, tok::less);
+}
+
+auto UnwrappedLineParser::
+    setupCpp2TemplateParameterDeclarationListFormatting() {
+  FormatToken *const Less = FormatTok;
+  return llvm::make_scope_exit([=]() {
+    if (Less->is(TT_TemplateOpener) && Cpp2Context.isDeclarationOrStatement())
+      Less->SpacesRequiredBefore = 1;
+  });
+}
+
+void UnwrappedLineParser::parseCpp2TemplateParameterDeclarationList() {
+  const auto _ = setupCpp2TemplateParameterDeclarationListFormatting();
+  parseCpp2ParameterDeclarationSeq({tok::less, TT_TemplateOpener});
+}
+
+auto UnwrappedLineParser::atCpp2ParameterDeclarationList(const CurrentToken Tok)
+    -> Cpp2ListOf {
+  return atCpp2ParameterDeclarationSeq(Tok, tok::l_paren);
+}
+
+void UnwrappedLineParser::parseCpp2ParameterDeclarationList() {
+  parseCpp2ParameterDeclarationSeq({tok::l_paren, TT_FunctionTypeLParen});
+}
+
+void UnwrappedLineParser::parseCpp2ThrowsSpecifier() {
+  parseCpp2Token(Keywords.kw_throws);
+}
+
+void UnwrappedLineParser::parseCpp2ReturnList() {
+  if (parseCpp2Token(tok::arrow, TT_TrailingReturnArrow)) {
+    parseCpp2ParameterDirection();
+    parseCpp2TypeId();
+  }
+}
+
+void UnwrappedLineParser::parseCpp2ContractSeq() {
+  if (!atCpp2Contract(FormatTok))
+    return;
+  if (parsingCpp2ImplicitBlock()) {
+    while (atCpp2Contract(FormatTok))
+      parseCpp2Contract();
+    return;
+  }
+  const auto _ = Cpp2Context.stack(&UnwrappedLineParser::parseCpp2ContractSeq);
+  parseBlock(/*MustBeDeclaration=*/false, /*AddLevels=*/1,
+             /*MuchSemi=*/false, /*KeepBraces=*/true,
+             /*IfStmtKind=*/nullptr, /*UnindentWhitesmithsBraces=*/false);
+}
+
+bool UnwrappedLineParser::atCpp2FunctionType(const CurrentToken Tok,
+                                             const Cpp2ListOf ExpectedList) {
+  assert(ExpectedList == Cpp2ListOf::Undecided ||
+         ExpectedList == Cpp2ListOf::Declarations);
+  const Cpp2ListOf ParsedList = atCpp2ParameterDeclarationList(Tok);
+  if (ParsedList == Cpp2ListOf::Declarations)
+    return true;
+  return ParsedList == ExpectedList;
+}
+
+bool UnwrappedLineParser::parseCpp2FunctionType(const Cpp2ListOf ExpectedList) {
+  if (!atCpp2FunctionType(FormatTok, ExpectedList))
+    return false;
+  parseCpp2ParameterDeclarationList();
+  parseCpp2ThrowsSpecifier();
+  parseCpp2ReturnList();
+  parseCpp2ContractSeq();
+  return true;
+}
+
+bool UnwrappedLineParser::parseCpp2TypeOrNamespace() {
+  if (!Cpp2Context.isDeclarationOrStatement() ||
+      !FormatTok->isOneOf(Keywords.kw_type, tok::kw_namespace) ||
+      Tokens->peekNextToken(/*SkipComment=*/true)->is(tok::equalequal)) {
+    return false;
+  }
+  const auto _ = Cpp2Context.stack(&UnwrappedLineParser::parseCpp2Statement);
+  if (FormatTok->is(Keywords.kw_type)) {
+    parseRecord();
+    addUnwrappedLine();
+  } else if (FormatTok->is(tok::kw_namespace)) {
+    parseNamespace();
+  }
+  return true;
+}
+
+bool UnwrappedLineParser::atCpp2AccessSpecifier(const CurrentToken Tok) const {
+  return Tok->isOneOf(tok::kw_public, tok::kw_protected, tok::kw_private,
+                      tok::kw_export);
+}
+
+void UnwrappedLineParser::parseCpp2AccessSpecifier() {
+  parseCpp2Token(&UnwrappedLineParser::atCpp2AccessSpecifier);
+}
+
+auto UnwrappedLineParser::setupCpp2RequiresClauseFormatting() {
+  const bool ParsedContract = !FormatTok->Previous;
+  const bool ParseLine = ParsedContract && FormatTok->is(tok::kw_requires);
+  if (ParseLine) {
+    addUnwrappedLine();
+    Line->Level += 1;
+  }
+  return llvm::make_scope_exit([=]() {
+    if (ParseLine) {
+      addUnwrappedLine();
+      Line->Level -= 1;
+    }
+  });
+}
+
+void UnwrappedLineParser::parseCpp2RequiresClause() {
+  const auto _ = setupCpp2RequiresClauseFormatting();
+  if (parseCpp2Token(tok::kw_requires, TT_RequiresClause))
+    parseCpp2LogicalOrExpression();
+}
+
+void UnwrappedLineParser::parseCpp2DeclarationBinaryOperator() {
+  parseCpp2Token({tok::equal, tok::equalequal},
+                 TT_Cpp2DeclarationBinaryOperator);
+}
+
+void UnwrappedLineParser::parseCpp2UnnamedDeclaration() {
+  const auto _ = Cpp2Context.isTemplateArgumentList()
+                     ? Cpp2Context.stackTemplateArgumentList()
+                     : Cpp2Context.stackSomethingElse();
+  parseCpp2Declaration();
+}
+
+namespace {
+
+struct Cpp2Declaration {
+  const FormatToken *AccessSpecifier = nullptr;
+  const FormatToken *Identifier = nullptr;
+  const FormatToken *Colon = nullptr;
+  CurrentToken Tok = nullptr;
+
+  bool IsTopLevel() const {
+    return (!AccessSpecifier || AccessSpecifier->is(tok::kw_export)) &&
+           Identifier && Colon;
+  }
+  bool IsStatement() const { return Identifier && Colon; }
+};
+
+} // namespace
+
+auto UnwrappedLineParser::atCpp2DeclarationHead(CurrentToken Tok) {
+  const ScopedTokenPosition _(Tokens);
+  Cpp2Declaration Res;
+  CurrentTokenIterator<getNextNonComment> It{std::exchange(Tok, nullptr),
+                                             Tokens};
+  if (atCpp2AccessSpecifier(*It))
+    Res.AccessSpecifier = It++;
+  for (int TotalTokens = atCpp2IdentifierTokens(*It); TotalTokens-- != 0;)
+    Res.Identifier = It++;
+  if (It->is(tok::colon))
+    Res.Colon = It++;
+  Res.Tok = It.Tok;
+  return Res;
+}
+
+void UnwrappedLineParser::parseCpp2DeclarationHead() {
+  parseCpp2AccessSpecifier();
+  parseCpp2Identifier();
+  parseCpp2Token(tok::ellipsis);
+  parseCpp2DeclarationColon();
+}
+
+auto UnwrappedLineParser::parseCpp2DeclarationSignature()
+    -> Cpp2ParsedDeclarationSignature {
+  Cpp2ParsedDeclarationSignature SigParse;
+  parseCpp2MetaFunctionsList();
+  parseCpp2TemplateParameterDeclarationList();
+  SigParse.HasFunctionType = parseCpp2FunctionType();
+  parseCpp2Token(Keywords.kw_final);
+  if ((SigParse.ParsedInitializer = parseCpp2TypeOrNamespace()))
+    return SigParse;
+  parseCpp2Token(Keywords.kw_type);
+  parseCpp2Token(tok::kw_namespace);
+  if (!SigParse.HasFunctionType)
+    parseCpp2TypeId();
+  parseCpp2RequiresClause();
+  return SigParse;
+}
+
+auto UnwrappedLineParser::setupCpp2DeclarationInitializerFormatting(
+    const Cpp2ParsedDeclarationSignature SigParse) {
+  FormatToken *LBrace = FormatTok;
+  return llvm::make_scope_exit([=]() {
+    if (SigParse.HasFunctionType && LBrace->is(tok::l_brace))
+      LBrace->setFinalizedType(TT_FunctionLBrace);
+  });
+}
+
+void UnwrappedLineParser::parseCpp2DeclarationInitializer(
+    const Cpp2ParsedDeclarationSignature SigParse) {
+  if (SigParse.ParsedInitializer)
+    return;
+  parseCpp2DeclarationBinaryOperator();
+  const auto _ = setupCpp2DeclarationInitializerFormatting(SigParse);
+  if (!parsesCpp2(&UnwrappedLineParser::parseCpp2Statement)) {
+    parseCpp2TypeId();
+    parseCpp2Semi();
+  }
+}
+
+bool UnwrappedLineParser::atCpp2Declaration() {
+  return atCpp2DeclarationHead(FormatTok).IsStatement();
+}
+
+void UnwrappedLineParser::parseCpp2Declaration() {
+  parseCpp2DeclarationHead();
+  const auto SigParse = parseCpp2DeclarationSignature();
+  parseCpp2DeclarationInitializer(SigParse);
+}
+
+bool UnwrappedLineParser::atCpp2TopLevelDeclaration() {
+  return atCpp2DeclarationHead(FormatTok).IsTopLevel();
+}
+
+void UnwrappedLineParser::parseCpp2TopLevelDeclaration() {
+  Cpp2FormatTokenSource Cpp2Tokens(Tokens);
+
+  const ScopedStackValue<FormatTokenSource *> _0(Tokens, &Cpp2Tokens);
+  const ScopedStackValue _1(Line->InCpp2Declaration, true);
+
+  parseCpp2Declaration();
+  addUnwrappedLine();
 }
 
 bool UnwrappedLineParser::tryToParsePropertyAccessor() {
@@ -2745,7 +4081,10 @@ void UnwrappedLineParser::parseUnbracedBody(bool CheckEOF) {
   addUnwrappedLine();
   ++Line->Level;
   ++Line->UnbracedBodyLevel;
-  parseStructuralElement();
+  if (Line->InCpp2Declaration)
+    parseCpp2Statement();
+  else
+    parseStructuralElement();
   --Line->UnbracedBodyLevel;
 
   if (Tok) {
@@ -2851,9 +4190,13 @@ FormatToken *UnwrappedLineParser::parseIfThenElse(IfStmtKind *IfKind,
     nextToken();
   } else {
     KeepIfBraces = !Style.RemoveBracesLLVM || KeepBraces;
-    if (FormatTok->isOneOf(tok::kw_constexpr, tok::identifier))
+    if (FormatTok->is(tok::kw_constexpr) ||
+        (FormatTok->is(tok::identifier) && !Line->InCpp2Declaration)) {
       nextToken();
-    if (FormatTok->is(tok::l_paren)) {
+    }
+    if (Line->InCpp2Declaration) {
+      parseCpp2LogicalOrExpression();
+    } else if (FormatTok->is(tok::l_paren)) {
       FormatTok->setFinalizedType(TT_ConditionLParen);
       parseParens();
     }
@@ -3095,7 +4438,8 @@ void UnwrappedLineParser::parseNamespace() {
   } else {
     while (FormatTok->isOneOf(tok::identifier, tok::coloncolon, tok::kw_inline,
                               tok::l_square, tok::period, tok::l_paren) ||
-           (Style.isCSharp() && FormatTok->is(tok::kw_union))) {
+           (Style.isCSharp() && FormatTok->is(tok::kw_union)) ||
+           (Line->InCpp2Declaration && FormatTok->is(tok::equal))) {
       if (FormatTok->is(tok::l_square))
         parseSquare();
       else if (FormatTok->is(tok::l_paren))
@@ -3305,7 +4649,7 @@ void UnwrappedLineParser::parseLabel(bool LeftAlignLabel) {
     addUnwrappedLine();
   }
   Line->Level = OldLineLevel;
-  if (FormatTok->isNot(tok::l_brace)) {
+  if (FormatTok->isNot(tok::l_brace) && !Line->InCpp2Declaration) {
     parseStructuralElement();
     addUnwrappedLine();
   }
@@ -3885,23 +5229,6 @@ bool UnwrappedLineParser::parseStructLike() {
   return false;
 }
 
-namespace {
-// A class used to set and restore the Token position when peeking
-// ahead in the token source.
-class ScopedTokenPosition {
-  unsigned StoredPosition;
-  FormatTokenSource *Tokens;
-
-public:
-  ScopedTokenPosition(FormatTokenSource *Tokens) : Tokens(Tokens) {
-    assert(Tokens && "Tokens expected to not be null");
-    StoredPosition = Tokens->getPosition();
-  }
-
-  ~ScopedTokenPosition() { Tokens->setPosition(StoredPosition); }
-};
-} // namespace
-
 // Look to see if we have [[ by looking ahead, if
 // its not then rewind to the original position.
 bool UnwrappedLineParser::tryToParseSimpleAttribute() {
@@ -4013,7 +5340,11 @@ void UnwrappedLineParser::parseRecord(bool ParseAsExpr) {
                             tok::kw_alignas, tok::l_square) ||
          FormatTok->isAttribute() ||
          ((Style.Language == FormatStyle::LK_Java || Style.isJavaScript()) &&
-          FormatTok->isOneOf(tok::period, tok::comma))) {
+          FormatTok->isOneOf(tok::period, tok::comma)) ||
+         (Line->InCpp2Declaration &&
+          FormatTok->isOneOf(tok::equal, tok::kw_requires))) {
+    if (Line->InCpp2Declaration && FormatTok->is(tok::kw_requires))
+      parseCpp2RequiresClause();
     if (Style.isJavaScript() &&
         FormatTok->isOneOf(Keywords.kw_extends, Keywords.kw_implements)) {
       JSPastExtendsOrImplements = true;

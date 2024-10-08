@@ -827,33 +827,71 @@ void WhitespaceManager::alignConsecutiveAssignments() {
   if (!Style.AlignConsecutiveAssignments.Enabled)
     return;
 
-  AlignTokens(
-      Style,
-      [&](const Change &C) {
-        // Do not align on equal signs that are first on a line.
-        if (C.NewlinesBefore > 0)
-          return false;
+  const auto Align = [&](const bool TwoTokens,
+                         bool (*const Precondition)(const Change &),
+                         const auto Condition) {
+    AlignTokens(
+        Style,
+        [&](const Change &C) {
+          // Do not align assignments that are first on a line.
+          if (C.NewlinesBefore > 0)
+            return false;
 
-        // Do not align on equal signs that are last on a line.
-        if (&C != &Changes.back() && (&C + 1)->NewlinesBefore > 0)
-          return false;
+          // Do not align on assignments that are last on a line.
+          if (const unsigned Offset = TwoTokens && Changes.size() != 1;
+              &C != &Changes.back() && &C != (&Changes.back() - Offset) &&
+              (&C + 1 + Offset)->NewlinesBefore > 0) {
+            return false;
+          }
 
-        // Do not align operator= overloads.
-        FormatToken *Previous = C.Tok->getPreviousNonComment();
-        if (Previous && Previous->is(tok::kw_operator))
-          return false;
+          if (Precondition && !Precondition(C))
+            return false;
 
-        return Style.AlignConsecutiveAssignments.AlignCompound
-                   ? C.Tok->getPrecedence() == prec::Assignment
-                   : (C.Tok->is(tok::equal) ||
-                      // In Verilog the '<=' is not a compound assignment, thus
-                      // it is aligned even when the AlignCompound option is not
-                      // set.
-                      (Style.isVerilog() && C.Tok->is(tok::lessequal) &&
-                       C.Tok->getPrecedence() == prec::Assignment));
-      },
-      Changes, /*StartAt=*/0, Style.AlignConsecutiveAssignments,
-      /*RightJustify=*/true);
+          return Condition(C);
+        },
+        Changes, /*StartAt=*/0, Style.AlignConsecutiveAssignments,
+        /*RightJustify=*/true);
+  };
+
+  // Align assignments.
+  Align(/*TwoTokens=*/false,
+        [](const Change &C) {
+          FormatToken *Previous = C.Tok->getPreviousNonComment();
+          return !Previous ||
+                 !Previous->isOneOf(
+                     tok::kw_operator, // Do not align operator= overloads.
+                     TT_Cpp2DeclarationColon, // Align Cpp2's `:=`s below.
+                     tok::kw_namespace); // Do not align with a Cpp2 namespace.
+        },
+        [&](const Change &C) {
+          return Style.AlignConsecutiveAssignments.AlignCompound
+                     ? C.Tok->getPrecedence() == prec::Assignment
+                     : (C.Tok->is(tok::equal) ||
+                        // In Verilog the '<=' is not a compound assignment,
+                        // thus it is aligned even when the AlignCompound option
+                        // is not set.
+                        (Style.isVerilog() && C.Tok->is(tok::lessequal) &&
+                         C.Tok->getPrecedence() == prec::Assignment));
+        });
+
+  // Align Cpp2's `:=`s.
+  Align(/*TwoTokens=*/true, /*Precondition=*/nullptr, [&](const Change &C) {
+    return C.Tok->is(TT_Cpp2DeclarationColon) && C.Tok->Next &&
+           C.Tok->Next->is(tok::equal);
+  });
+
+  // Align Cpp2's `:==`s.
+  Align(/*TwoTokens=*/true, /*Precondition=*/nullptr, [&](const Change &C) {
+    return C.Tok->is(TT_Cpp2DeclarationColon) && C.Tok->Next &&
+           C.Tok->Next->is(tok::equalequal);
+  });
+
+  // Align Cpp2 alias' `==`s.
+  Align(/*TwoTokens=*/true, /*Precondition=*/nullptr, [&](const Change &C) {
+    return C.Tok->Previous && C.Tok->Previous->isNot(TT_Cpp2DeclarationColon) &&
+           C.Tok->is(TT_Cpp2DeclarationBinaryOperator) &&
+           C.Tok->is(tok::equalequal);
+  });
 }
 
 void WhitespaceManager::alignConsecutiveBitFields() {

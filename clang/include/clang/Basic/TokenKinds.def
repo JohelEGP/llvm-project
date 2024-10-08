@@ -252,6 +252,11 @@ PUNCTUATOR(periodstar,          ".*")
 PUNCTUATOR(arrowstar,           "->*")
 PUNCTUATOR(coloncolon,          "::")
 
+// Cpp2 Support
+PUNCTUATOR(dollar,              "$")
+PUNCTUATOR(periodperiodequal,   "..=")
+PUNCTUATOR(periodperiodless,    "..<")
+
 // Objective C support.
 PUNCTUATOR(at,                  "@")
 

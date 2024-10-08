@@ -123,8 +123,27 @@ void FormatTokenLexer::tryMergePreviousTokens() {
     return;
   if (tryMergeForEach())
     return;
-  if (Style.isCpp() && tryTransformTryUsageForC())
-    return;
+
+  if (Style.isCpp()) {
+    if (tryTransformTryUsageForC())
+      return;
+    if (tryMergeCpp2StringLiteral())
+      return;
+    static const tok::TokenKind PeriodPeriod[] = {tok::period, tok::period};
+    static const tok::TokenKind PeriodPeriodEqual[] = {tok::period, tok::equal};
+    static const tok::TokenKind PeriodPeriodLess[] = {tok::period, tok::less};
+    if (tryMergeTokens(PeriodPeriodEqual, TT_Cpp2PostfixOperator)) {
+      Tokens.back()->Tok.setKind(tok::periodperiodequal);
+      return;
+    }
+    if (tryMergeTokens(PeriodPeriodLess, TT_Cpp2PostfixOperator)) {
+      Tokens.back()->Tok.setKind(tok::periodperiodless);
+      return;
+    }
+    if (tryMergeTokens(PeriodPeriod, TT_Cpp2PeriodPeriod)) {
+      return;
+    }
+  }
 
   if (Style.isJavaScript() || Style.isCSharp()) {
     static const tok::TokenKind NullishCoalescingOperator[] = {tok::question,
@@ -326,20 +345,35 @@ void FormatTokenLexer::tryMergePreviousTokens() {
   }
 }
 
-bool FormatTokenLexer::tryMergeNSStringLiteral() {
+bool FormatTokenLexer::tryMergeStringLiteral(
+    bool (*const IsPrefix)(const FormatToken *), const TokenType Type) {
   if (Tokens.size() < 2)
     return false;
-  auto &At = *(Tokens.end() - 2);
+  auto &Prefix = *(Tokens.end() - 2);
   auto &String = *(Tokens.end() - 1);
-  if (At->isNot(tok::at) || String->isNot(tok::string_literal))
+  if (!IsPrefix(Prefix) || !String->is(tok::string_literal))
     return false;
-  At->Tok.setKind(tok::string_literal);
-  At->TokenText = StringRef(At->TokenText.begin(),
-                            String->TokenText.end() - At->TokenText.begin());
-  At->ColumnWidth += String->ColumnWidth;
-  At->setType(TT_ObjCStringLiteral);
+  Prefix->Tok.setKind(tok::string_literal);
+  Prefix->TokenText =
+      StringRef(Prefix->TokenText.begin(),
+                String->TokenText.end() - Prefix->TokenText.begin());
+  Prefix->ColumnWidth += String->ColumnWidth;
+  Prefix->setType(Type);
   Tokens.erase(Tokens.end() - 1);
   return true;
+}
+
+bool FormatTokenLexer::tryMergeCpp2StringLiteral() {
+  return tryMergeStringLiteral([](const FormatToken *const DollarBeforeR) {
+    return llvm::is_contained({"$", "u8$", "u$", "U$", "L$"},
+                              DollarBeforeR->TokenText);
+  });
+}
+
+bool FormatTokenLexer::tryMergeNSStringLiteral() {
+  return tryMergeStringLiteral(
+      [](const FormatToken *const At) { return At->is(tok::at); },
+      TT_ObjCStringLiteral);
 }
 
 bool FormatTokenLexer::tryMergeJSPrivateIdentifier() {
@@ -1421,10 +1455,35 @@ bool FormatTokenLexer::readRawTokenVerilogSpecific(Token &Tok) {
   return true;
 }
 
+bool FormatTokenLexer::readRawTokenCpp2Specific(Token &Tok) {
+  const char *Start = Lex->getBufferLocation();
+  auto Buffer = StringRef(Start, Lex->getBuffer().end() - Start);
+  size_t Len = [&]() -> size_t {
+    if (Buffer.starts_with("$R"))
+      return 1;
+    if (Buffer.starts_with("u$R") || Buffer.starts_with("U$R") ||
+        Buffer.starts_with("L$R"))
+      return 2;
+    if (Buffer.starts_with("u8$R"))
+      return 3;
+    return 0;
+  }();
+  if (Len == 0)
+    return false;
+
+  Tok.setKind(tok::raw_identifier);
+  Tok.setLength(Len);
+  Tok.setLocation(Lex->getSourceLocation(Start, Len));
+  Tok.setRawIdentifierData(Start);
+  Lex->seek(Lex->getCurrentBufferOffset() + Len, /*IsAtStartofline=*/false);
+  return true;
+}
+
 void FormatTokenLexer::readRawToken(FormatToken &Tok) {
   // For Verilog, first see if there is a special token, and fall back to the
   // normal lexer if there isn't one.
-  if (!Style.isVerilog() || !readRawTokenVerilogSpecific(Tok.Tok))
+  if ((!Style.isVerilog() || !readRawTokenVerilogSpecific(Tok.Tok)) &&
+      (!Style.isCpp() || !readRawTokenCpp2Specific(Tok.Tok)))
     Lex->LexFromRawLexer(Tok.Tok);
   Tok.TokenText = StringRef(SourceMgr.getCharacterData(Tok.Tok.getLocation()),
                             Tok.Tok.getLength());

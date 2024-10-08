@@ -54,6 +54,7 @@ public:
         InPPDirective(Line.InPPDirective),
         InPragmaDirective(Line.InPragmaDirective),
         InMacroBody(Line.InMacroBody),
+        InCpp2Declaration(Line.InCpp2Declaration),
         MustBeDeclaration(Line.MustBeDeclaration), MightBeFunctionDecl(false),
         IsMultiVariableDeclStmt(false), Affected(false),
         LeadingEmptyLinesAffected(false), ChildrenAffected(false),
@@ -147,6 +148,12 @@ public:
 
   /// \c true if this line starts a namespace definition.
   bool startsWithNamespace() const {
+    if (InCpp2Declaration) {
+      return startsWith(TT_Cpp2Identifier, TT_Cpp2DeclarationColon,
+                        tok::kw_namespace, tok::equal) ||
+             startsWith(tok::kw_export, TT_Cpp2Identifier,
+                        TT_Cpp2DeclarationColon, tok::kw_namespace, tok::equal);
+    }
     return startsWith(tok::kw_namespace) || startsWith(TT_NamespaceMacro) ||
            startsWith(tok::kw_inline, tok::kw_namespace) ||
            startsWith(tok::kw_export, tok::kw_namespace);
@@ -175,6 +182,7 @@ public:
   bool InPPDirective;
   bool InPragmaDirective;
   bool InMacroBody;
+  bool InCpp2Declaration;
   bool MustBeDeclaration;
   bool MightBeFunctionDecl;
   bool IsMultiVariableDeclStmt;

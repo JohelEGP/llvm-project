@@ -151,6 +151,7 @@ public:
       llvm::dbgs() << "  Jump from: " << (Tokens.size() - 1) << " -> "
                    << Position << "\n";
     });
+    Jumps[Position] = Next;
     Jumps[Tokens.size() - 1] = Position;
     Position = Next;
     LLVM_DEBUG({
@@ -166,10 +167,8 @@ private:
   int successor(int Current) const {
     int Next = Current + 1;
     auto it = Jumps.find(Next);
-    if (it != Jumps.end()) {
+    if (it != Jumps.end())
       Next = it->second;
-      assert(!Jumps.contains(Next));
-    }
     return Next;
   }
 

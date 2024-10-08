@@ -17,6 +17,8 @@
 
 #include "Macros.h"
 #include <stack>
+#include <variant>
+#include <vector>
 
 namespace clang {
 namespace format {
@@ -48,6 +50,8 @@ struct UnwrappedLine {
   bool InPragmaDirective = false;
   /// Whether it is part of a macro body.
   bool InMacroBody = false;
+  /// Whether it is part of a Cpp2 declaration.
+  bool InCpp2Declaration = false;
 
   /// Nesting level of unbraced body of a control statement.
   unsigned UnbracedBodyLevel = 0;
@@ -171,6 +175,157 @@ private:
   void parseRequiresClause(FormatToken *RequiresToken);
   void parseRequiresExpression(FormatToken *RequiresToken);
   void parseConstraintExpression();
+  class Cpp2FormatTokenSource;
+  /// \pre The last result of \c Tokens->getNextToken().
+  using CurrentToken = const FormatToken *;
+  template <CurrentToken (*Increment)(FormatTokenSource *)>
+  struct CurrentTokenIterator;
+  using Cpp2AtFunction = bool (UnwrappedLineParser::*)(CurrentToken) const;
+  using Cpp2ParserFunction = void (UnwrappedLineParser::*)();
+  class Cpp2ParseContext {
+  private:
+    enum class C : unsigned char {
+      DeclOrStmt,  // `{ ... }` is a block. Otherwise, it's a child block.
+      TempArgList, // `< > <= >= << >> <<= >>=` are not operators.
+                   // Otherwise, they are operators.
+      SomethingElse
+    } Context = C::DeclOrStmt;
+
+  public:
+    auto stackDeclarationOrStatement();
+    auto stackTemplateArgumentList();
+    auto stackSomethingElse();
+    bool isDeclarationOrStatement() const { return Context == C::DeclOrStmt; }
+    bool isTemplateArgumentList() const { return Context == C::TempArgList; }
+
+  private:
+    Cpp2ParserFunction Parser = nullptr;
+
+  public:
+    auto stack(Cpp2ParserFunction);
+    Cpp2ParserFunction getParser() const { return Parser; }
+  };
+  struct Cpp2Punctuator {
+    tok::TokenKind Kind = tok::unknown;
+    TokenType Type = TT_Unknown;
+  };
+  struct Cpp2ParsedDeclarationSignature {
+    bool HasFunctionType = false;
+    bool ParsedInitializer = false;
+  };
+  enum class Cpp2ListOf {
+    NotAList,
+    Undecided, // Could be declarations or expressions.
+    Expressions,
+    Declarations
+  };
+  using Cpp2TokenToParse =
+      std::variant<tok::TokenKind, const IdentifierInfo *, Cpp2AtFunction>;
+  Cpp2ParseContext Cpp2Context;
+  bool parseCpp2Token(Cpp2TokenToParse, TokenType = TT_Unknown);
+  bool parseCpp2Token(ArrayRef<Cpp2TokenToParse>, TokenType = TT_Unknown);
+  bool parsesCpp2(Cpp2ParserFunction);
+  auto setupCpp2BalancedPunctuatorsFormatting(TokenType, tok::TokenKind);
+  void parseCpp2BalancedPunctuators(Cpp2Punctuator Opener, Cpp2ParserFunction);
+  void parseCpp2Until(tok::TokenKind, Cpp2ParserFunction);
+  void parseCpp2BlockBody();
+  bool parsingCpp2ImplicitBlock() const;
+  void parseCpp2Block(Cpp2ParserFunction);
+  template <Cpp2ParserFunction> void parseCommaSeparatedCpp2();
+  void parseCpp2DeclarationColon();
+  void parseCpp2Semi();
+  void parseCpp2Literal();
+  void parseCpp2MultiTokenType();
+  bool isCpp2SingleTokenOperator(CurrentToken) const;
+  int atCpp2IdentifierTokens(CurrentToken);
+  bool parseCpp2Identifier();
+  void parseCpp2TypeQualifierSeq();
+  void parseCpp2TypeId();
+  void parseCpp2TemplateArgument();
+  bool atCpp2TemplateArgumentList(CurrentToken);
+  void parseCpp2TemplateArgumentList();
+  void parseCpp2UnqualifiedId();
+  void parseCpp2IdExpression();
+  void parseCpp2ExpressionList();
+  void parseCpp2PrimaryExpression();
+  bool atCpp2PostfixOperator(CurrentToken) const;
+  bool parseCpp2PostfixOperator();
+  void parseCpp2PostfixExpression();
+  bool atCpp2ParameterDirection(CurrentToken) const;
+  bool parseCpp2ParameterDirection();
+  bool parseCpp2PrefixOperator();
+  void parseCpp2PrefixExpression();
+  void parseCpp2IsAsExpressionTarget();
+  void parseCpp2IsAsExpression();
+  bool atCpp2BinaryOperator(CurrentToken, prec::Level) const;
+  bool parseCpp2BinaryOperator(prec::Level);
+  void parseCpp2BinaryExpression(prec::Level);
+  void parseCpp2LogicalOrExpression();
+  void parseCpp2AssignmentExpression();
+  void parseCpp2Expression();
+  bool atCpp2AltName(CurrentToken) const;
+  void parseCpp2AltName();
+  void parseCpp2Alternative();
+  auto setupCpp2InspectExpressionFormatting();
+  void parseCpp2InspectExpression();
+  auto setupCpp2CompoundStatementFormatting();
+  void parseCpp2CompoundStatement();
+  void parseCpp2SelectionStatement();
+  void parseCpp2UsingStatement();
+  void parseCpp2ReturnStatement();
+  void parseCpp2JumpStatement();
+  void parseCpp2NextClause();
+  void parseCpp2WhileStatement();
+  void parseCpp2DoStatement();
+  bool atCpp2ParameterizedStatement(CurrentToken);
+  void parseCpp2ParameterizedStatement();
+  void parseCpp2ForStatement();
+  bool atCpp2LabelIdentifier(CurrentToken);
+  bool parseCpp2Label();
+  void parseCpp2IterationStatementWithoutLabel();
+  void parseCpp2ExpressionStatement();
+  bool atCpp2Contract(CurrentToken) const;
+  void parseCpp2Contract();
+  void parseCpp2ContractStatement();
+  void parseCpp2Statement();
+  void parseCpp2MetaFunctionsList();
+  bool precedesCpp2Identifier(CurrentToken) const;
+  bool atCpp2ThisSpecifier(CurrentToken) const;
+  void parseCpp2ThisSpecifier();
+  auto atCpp2ParameterDeclarationHead(CurrentToken);
+  void parseCpp2ParameterDeclaration();
+  bool skipCpp2BalancedTokens(CurrentToken &);
+  CurrentToken skipCpp2DeclarationSignature(CurrentToken,
+                                            tok::TokenKind Closer);
+  Cpp2ListOf atCpp2ParameterDeclarationSeq(CurrentToken, tok::TokenKind Opener);
+  void parseCpp2ParameterDeclarationSeq(Cpp2Punctuator Opener);
+  Cpp2ListOf atCpp2TemplateParameterDeclarationList(CurrentToken);
+  auto setupCpp2TemplateParameterDeclarationListFormatting();
+  void parseCpp2TemplateParameterDeclarationList();
+  Cpp2ListOf atCpp2ParameterDeclarationList(CurrentToken);
+  void parseCpp2ParameterDeclarationList();
+  void parseCpp2ThrowsSpecifier();
+  void parseCpp2ReturnList();
+  void parseCpp2ContractSeq();
+  bool atCpp2FunctionType(CurrentToken, Cpp2ListOf);
+  bool parseCpp2FunctionType(Cpp2ListOf Expected = Cpp2ListOf::Undecided);
+  bool parseCpp2TypeOrNamespace();
+  bool atCpp2AccessSpecifier(CurrentToken) const;
+  void parseCpp2AccessSpecifier();
+  auto setupCpp2RequiresClauseFormatting();
+  void parseCpp2RequiresClause();
+  void parseCpp2DeclarationBinaryOperator();
+  void parseCpp2UnnamedDeclaration();
+  auto atCpp2DeclarationHead(CurrentToken);
+  void parseCpp2DeclarationHead();
+  Cpp2ParsedDeclarationSignature parseCpp2DeclarationSignature();
+  auto
+      setupCpp2DeclarationInitializerFormatting(Cpp2ParsedDeclarationSignature);
+  void parseCpp2DeclarationInitializer(Cpp2ParsedDeclarationSignature);
+  bool atCpp2Declaration();
+  void parseCpp2Declaration();
+  bool atCpp2TopLevelDeclaration();
+  void parseCpp2TopLevelDeclaration();
   void parseJavaEnumBody();
   // Parses a record (aka class) as a top level element. If ParseAsExpr is true,
   // parses the record as a child block, i.e. if the class declaration is an

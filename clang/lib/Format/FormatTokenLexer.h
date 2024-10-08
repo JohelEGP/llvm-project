@@ -48,6 +48,9 @@ private:
 
   bool tryMergeLessLess();
   bool tryMergeGreaterGreater();
+  bool tryMergeStringLiteral(bool (*IsPrefix)(const FormatToken *),
+                             TokenType = TT_Unknown);
+  bool tryMergeCpp2StringLiteral();
   bool tryMergeNSStringLiteral();
   bool tryMergeJSPrivateIdentifier();
   bool tryMergeCSharpStringLiteral();
@@ -141,6 +144,9 @@ private:
 
   /// Handle Verilog-specific tokens.
   bool readRawTokenVerilogSpecific(Token &Tok);
+
+  /// Handle Cpp2-specific tokens.
+  bool readRawTokenCpp2Specific(Token &Tok);
 
   void readRawToken(FormatToken &Tok);
 
