@@ -4992,6 +4992,13 @@ bool TokenAnnotator::spaceRequiredBefore(const AnnotatedLine &Line,
         return Left.isNot(tok::less);
       if (Right.is(TT_TemplateOpener))
         return false;
+      // A range operator where the `..` is part of the Cpp1-lexed `double`.
+      if ((Left.TokenText.ends_with("..") &&
+           Right.isOneOf(tok::equal, tok::less)) ||
+          (Left.isOneOf(tok::equal, tok::less) && Left.Previous &&
+           Left.Previous->TokenText.ends_with(".."))) {
+        return false;
+      }
     }
 
     if (Left.is(TT_OverloadedOperator) &&
