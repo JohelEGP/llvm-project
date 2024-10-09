@@ -2806,9 +2806,10 @@ void UnwrappedLineParser::parseCpp2PostfixExpression() {
 bool UnwrappedLineParser::atCpp2ParameterDirection(
     const CurrentToken Tok) const {
   const FormatToken *const Next = Tokens->peekNextToken(/*SkipComment=*/true);
-  return llvm::is_contained({Keywords.kw_in, Keywords.kw_copy,
-                             Keywords.kw_inout, Keywords.kw_out,
-                             Keywords.kw_move, Keywords.kw_forward},
+  return llvm::is_contained({Keywords.kw_in, Keywords.kw_in_ref,
+                             Keywords.kw_copy, Keywords.kw_inout,
+                             Keywords.kw_out, Keywords.kw_move,
+                             Keywords.kw_forward, Keywords.kw_forward_ref},
                             Tok->Tok.getIdentifierInfo()) &&
          (startsCpp2Identifier(Next) || Next->is(tok::colon));
 }

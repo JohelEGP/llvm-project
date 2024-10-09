@@ -1109,9 +1109,11 @@ struct AdditionalKeywords {
     // Cpp2 keywords
     kw_next = &IdentTable.get("next");
     kw_inspect = &IdentTable.get("inspect");
+    kw_in_ref = &IdentTable.get("in_ref");
     kw_copy = &IdentTable.get("copy");
     kw_move = &IdentTable.get("move");
     kw_forward = &IdentTable.get("forward");
+    kw_forward_ref = &IdentTable.get("forward_ref");
     kw_pre = &IdentTable.get("pre");
     kw_post = &IdentTable.get("post");
 
@@ -1430,9 +1432,11 @@ struct AdditionalKeywords {
   // Cpp2 keywords.
   IdentifierInfo *kw_inspect;
   IdentifierInfo *kw_next;
+  IdentifierInfo *kw_in_ref;
   IdentifierInfo *kw_copy;
   IdentifierInfo *kw_move;
   IdentifierInfo *kw_forward;
+  IdentifierInfo *kw_forward_ref;
   IdentifierInfo *kw_pre;
   IdentifierInfo *kw_post;
 
