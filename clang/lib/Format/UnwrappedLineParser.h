@@ -185,9 +185,9 @@ private:
   class Cpp2ParseContext {
   private:
     enum class C : unsigned char {
-      DeclOrStmt,  // `{ ... }` is a block. Otherwise, it's a child block.
-      TempArgList, // `< > <= >= << >> <<= >>=` are not operators.
-                   // Otherwise, they are operators.
+      DeclOrStmt,   // `{ ... }` is a block. Otherwise, it's a child block.
+      TempDiamonds, // `< > <= >= << >> <<= >>=` are not operators.
+                    // Otherwise, they are operators.
       SomethingElse
     } Context = C::DeclOrStmt;
 
@@ -196,7 +196,7 @@ private:
     auto stackTemplateArgumentList();
     auto stackSomethingElse();
     bool isDeclarationOrStatement() const { return Context == C::DeclOrStmt; }
-    bool isTemplateArgumentList() const { return Context == C::TempArgList; }
+    bool isTemplateDiamonds() const { return Context == C::TempDiamonds; }
 
   private:
     Cpp2ParserFunction Parser = nullptr;

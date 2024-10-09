@@ -2198,7 +2198,7 @@ auto UnwrappedLineParser::Cpp2ParseContext::stackDeclarationOrStatement() {
   return ScopedStackValue(Context, C::DeclOrStmt);
 }
 auto UnwrappedLineParser::Cpp2ParseContext::stackTemplateArgumentList() {
-  return ScopedStackValue(Context, C::TempArgList);
+  return ScopedStackValue(Context, C::TempDiamonds);
 }
 auto UnwrappedLineParser::Cpp2ParseContext::stackSomethingElse() {
   return ScopedStackValue(Context, C::SomethingElse);
@@ -2841,7 +2841,7 @@ bool UnwrappedLineParser::atCpp2BinaryOperator(const CurrentToken Tok,
     [[fallthrough]];
   case prec::Relational:
   case prec::Shift:
-    if (Cpp2Context.isTemplateArgumentList())
+    if (Cpp2Context.isTemplateDiamonds())
       return false;
     break;
   default:
@@ -3373,7 +3373,7 @@ void UnwrappedLineParser::parseCpp2DeclarationBinaryOperator() {
 }
 
 void UnwrappedLineParser::parseCpp2UnnamedDeclaration() {
-  const auto _ = Cpp2Context.isTemplateArgumentList()
+  const auto _ = Cpp2Context.isTemplateDiamonds()
                      ? Cpp2Context.stackTemplateArgumentList()
                      : Cpp2Context.stackSomethingElse();
   parseCpp2Declaration();
