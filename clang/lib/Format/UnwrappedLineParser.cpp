@@ -2746,8 +2746,9 @@ void UnwrappedLineParser::parseCpp2PrimaryExpression() {
 bool UnwrappedLineParser::atCpp2PostfixOperator(const CurrentToken Tok) const {
   if (Tok->isOneOf(tok::plusplus, tok::minusminus, tok::tilde, tok::dollar,
                    tok::ellipsis, tok::periodperiodequal,
-                   tok::periodperiodless))
+                   tok::periodperiodless)) {
     return true;
+  }
   if (Tok->isOneOf(tok::star, tok::amp)) {
     FormatToken *const Next = Tokens->peekNextToken(/*SkipComment=*/true);
     return !Next->is(tok::l_paren) && !startsCpp2Identifier(Next) &&
@@ -3241,7 +3242,6 @@ auto UnwrappedLineParser::atCpp2ParameterDeclarationSeq(
 
 void UnwrappedLineParser::parseCpp2ParameterDeclarationSeq(
     const Cpp2Punctuator Opener) {
-  const auto _ = Cpp2Context.stackSomethingElse();
   parseCpp2BalancedPunctuators(
       Opener, &UnwrappedLineParser::parseCommaSeparatedCpp2<
                   &UnwrappedLineParser::parseCpp2ParameterDeclaration>);
@@ -3262,7 +3262,8 @@ auto UnwrappedLineParser::
 }
 
 void UnwrappedLineParser::parseCpp2TemplateParameterDeclarationList() {
-  const auto _ = setupCpp2TemplateParameterDeclarationListFormatting();
+  const auto _0 = setupCpp2TemplateParameterDeclarationListFormatting();
+  const auto _1 = Cpp2Context.stackTemplateArgumentList();
   parseCpp2ParameterDeclarationSeq({tok::less, TT_TemplateOpener});
 }
 
