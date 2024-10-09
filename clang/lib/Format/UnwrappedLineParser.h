@@ -188,15 +188,18 @@ private:
       DeclOrStmt,   // `{ ... }` is a block. Otherwise, it's a child block.
       TempDiamonds, // `< > <= >= << >> <<= >>=` are not operators.
                     // Otherwise, they are operators.
+      TypeOnly,
       SomethingElse
     } Context = C::DeclOrStmt;
 
   public:
     auto stackDeclarationOrStatement();
     auto stackTemplateArgumentList();
+    auto stackTypeOnly(bool);
     auto stackSomethingElse();
     bool isDeclarationOrStatement() const { return Context == C::DeclOrStmt; }
     bool isTemplateDiamonds() const { return Context == C::TempDiamonds; }
+    bool isTypeOnly() const { return Context == C::TypeOnly; }
 
   private:
     Cpp2ParserFunction Parser = nullptr;
@@ -212,6 +215,7 @@ private:
   struct Cpp2ParsedDeclarationSignature {
     bool HasFunctionType = false;
     bool ParsedInitializer = false;
+    bool IsType = false;
   };
   enum class Cpp2ListOf {
     NotAList,

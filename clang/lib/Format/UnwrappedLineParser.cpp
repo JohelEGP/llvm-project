@@ -2187,7 +2187,13 @@ template <class T> class [[nodiscard]] ScopedStackValue {
 public:
   ScopedStackValue(T &obj, const T new_value)
       : object{&obj}, old_value{std::exchange(obj, new_value)} {}
-  ~ScopedStackValue() { *object = old_value; }
+  ScopedStackValue(ScopedStackValue &&other) noexcept
+      : object{std::exchange(other.object, nullptr)},
+        old_value{other.old_value} {}
+  ~ScopedStackValue() {
+    if (object)
+      *object = old_value;
+  }
 };
 
 template <class T> ScopedStackValue(T &, T) -> ScopedStackValue<T>;
@@ -2199,6 +2205,11 @@ auto UnwrappedLineParser::Cpp2ParseContext::stackDeclarationOrStatement() {
 }
 auto UnwrappedLineParser::Cpp2ParseContext::stackTemplateArgumentList() {
   return ScopedStackValue(Context, C::TempDiamonds);
+}
+auto UnwrappedLineParser::Cpp2ParseContext::stackTypeOnly(bool b) {
+  if (b)
+    return std::optional{ScopedStackValue(Context, C::TypeOnly)};
+  return std::optional<ScopedStackValue<C>>{};
 }
 auto UnwrappedLineParser::Cpp2ParseContext::stackSomethingElse() {
   return ScopedStackValue(Context, C::SomethingElse);
@@ -2557,8 +2568,10 @@ void UnwrappedLineParser::parseCpp2DeclarationColon() {
 }
 
 void UnwrappedLineParser::parseCpp2Semi() {
-  if (Cpp2Context.isDeclarationOrStatement() && parseCpp2Token(tok::semi))
+  if ((Cpp2Context.isDeclarationOrStatement() || Cpp2Context.isTypeOnly()) &&
+      parseCpp2Token(tok::semi)) {
     return addUnwrappedLine();
+  }
   const FormatToken *const Next = Tokens->peekNextToken(/*SkipComment=*/true);
   if (Next->isOneOf(tok::l_paren, tok::r_paren, tok::r_square, tok::comma,
                     Keywords.kw_is, Keywords.kw_as)) {
@@ -3305,6 +3318,8 @@ bool UnwrappedLineParser::atCpp2FunctionType(const CurrentToken Tok,
                                              const Cpp2ListOf ExpectedList) {
   assert(ExpectedList == Cpp2ListOf::Undecided ||
          ExpectedList == Cpp2ListOf::Declarations);
+  if (FormatTok->is(tok::l_paren) && Cpp2Context.isTypeOnly())
+    return true;
   const Cpp2ListOf ParsedList = atCpp2ParameterDeclarationList(Tok);
   if (ParsedList == Cpp2ListOf::Declarations)
     return true;
@@ -3427,7 +3442,7 @@ auto UnwrappedLineParser::parseCpp2DeclarationSignature()
   parseCpp2Token(Keywords.kw_final);
   if ((SigParse.ParsedInitializer = parseCpp2TypeOrNamespace()))
     return SigParse;
-  parseCpp2Token(Keywords.kw_type);
+  SigParse.IsType = parseCpp2Token(Keywords.kw_type);
   parseCpp2Token(tok::kw_namespace);
   if (!SigParse.HasFunctionType)
     parseCpp2TypeId();
@@ -3448,9 +3463,12 @@ void UnwrappedLineParser::parseCpp2DeclarationInitializer(
     const Cpp2ParsedDeclarationSignature SigParse) {
   if (SigParse.ParsedInitializer)
     return;
+  const bool IsAlias = FormatTok->is(tok::equalequal);
   parseCpp2DeclarationBinaryOperator();
-  const auto _ = setupCpp2DeclarationInitializerFormatting(SigParse);
-  if (!parsesCpp2(&UnwrappedLineParser::parseCpp2Statement)) {
+  const auto _0 = setupCpp2DeclarationInitializerFormatting(SigParse);
+  const auto _1 = Cpp2Context.stackTypeOnly(SigParse.IsType && IsAlias);
+  if (Cpp2Context.isTypeOnly() ||
+      !parsesCpp2(&UnwrappedLineParser::parseCpp2Statement)) {
     parseCpp2TypeId();
     parseCpp2Semi();
   }
