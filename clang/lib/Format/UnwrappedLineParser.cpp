@@ -2694,8 +2694,10 @@ void UnwrappedLineParser::parseCpp2TypeId() {
 }
 
 void UnwrappedLineParser::parseCpp2TemplateArgument() {
-  if (!parsesCpp2(&UnwrappedLineParser::parseCpp2Expression))
+  if (!parseCpp2FunctionType(Cpp2ListOf::Declarations) &&
+      !parsesCpp2(&UnwrappedLineParser::parseCpp2Expression)) {
     parseCpp2TypeId();
+  }
 }
 
 bool UnwrappedLineParser::atCpp2TemplateArgumentList(const CurrentToken Tok) {
